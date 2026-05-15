@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     # Optional: set these so the scheduler can auto-refresh the token on 401
     api_login_email: Optional[str] = None
     api_login_password: Optional[str] = None
-    api_login_path: str = "/auth/login"  # POST endpoint that returns access_token
+    api_login_path: str = "/login"  # POST endpoint that returns access_token
 
     # Redis / Celery
     redis_url: str = "redis://localhost:6379/0"

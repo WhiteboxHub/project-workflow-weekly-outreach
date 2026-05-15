@@ -79,6 +79,20 @@ make scheduler
 # or: python run_scheduler.py
 ```
 
+### 7. Run Analytics (After Campaign Sends)
+
+Once emails have been sent, export campaign data and view bounce reports:
+
+```bash
+python run_analytics.py
+```
+
+This will:
+- Fetch all completed email records from the API
+- Save a Parquet file to `./data/analytics/`
+- Print bounce summary, SMTP health, and suppression list to the console
+- Write `./data/suppression_list.csv` (hard bounces + invalid emails)
+
 ## Verify It's Working
 
 ### Check Scheduler Logs
@@ -103,20 +117,29 @@ email_sent_successfully
 executing_reset_webhook endpoint="execute-reset-sql" status=200
 ```
 
+For bounced emails you'll see one of:
+
+```
+worker_invalid_email vendor_email="bad-email"
+worker_permanent_bounce bounce_type="hard" error="550 no such user"
+worker_transient_error error="Connection timed out"  # retried up to 3x
+```
+
 ### Check Database
 
-Because the proxy architecture queries natively from the master FAPI PostgreSQL repository, execute these via your main server:
-
 ```sql
--- Check automation_logs status
-SELECT id, workflow_id, status
-FROM automation_workflow_logs
-ORDER BY created_at DESC;
-
--- Check Campaign Emails logs and status loops
-SELECT id, vendor_email, status, retry_count
+-- Check campaign email status and bounce types
+SELECT status, bounce_type, COUNT(*) AS count
 FROM campaign_emails
-ORDER BY updated_at DESC
+WHERE candidate_id = 570
+GROUP BY status, bounce_type
+ORDER BY status;
+
+-- View suppression list (never contact again)
+SELECT vendor_email, bounce_type, error_message
+FROM campaign_emails
+WHERE bounce_type IN ('hard', 'invalid')
+ORDER BY last_attempt_at DESC
 LIMIT 10;
 ```
 
@@ -145,3 +168,9 @@ LIMIT 10;
 - Use App Password, not regular Gmail password
 - Enable "Less secure app access" if using regular SMTP
 - Check firewall allows outbound port 587/465
+
+### "Analytics shows no data"
+
+- Ensure at least one campaign has run and emails have `status = 'sent' / 'bounced' / 'failed'`
+- Check `MAIN_API_BASE_URL` and `API_BEARER_TOKEN` are set in `.env`
+- Run `python run_analytics.py --report-only` if you already have Parquet files

@@ -13,22 +13,112 @@ from typing import Dict, Any, Optional
 
 import httpx
 
-from app.integrations.smtp_client import SMTPPermanentError
+from app.integrations.smtp_client import SMTPPermanentError, SMTPTransientError
 
 from app.workers.celery_app import celery_app
 from app.core.config import settings
+from app.core.auth import APIAuth
 from app.core.logging import get_logger
 from app.core.redis_client import record_task_outcome, claim_report_slot
 from app.services.email_service import EmailService
 from app.services.report_service import send_run_report
 
+import re
+
 logger = get_logger(__name__)
+
+# ── Email validation ────────────────────────────────────────────────────────
+_EMAIL_RE = re.compile(
+    r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+)
+
+# SMTP codes that indicate a permanent hard bounce (address is gone forever)
+_HARD_BOUNCE_CODES = {550, 551, 552, 553, 554}
+
+# Phrases in error messages that confirm a hard bounce regardless of code
+_HARD_BOUNCE_PHRASES = [
+    "does not exist",
+    "no such user",
+    "user unknown",
+    "invalid address",
+    "address rejected",
+    "mailbox not found",
+    "recipient address rejected",
+    "bad destination",
+]
+
+
+def _sanitize_email(email: Any) -> str:
+    """
+    Enterprise-grade email sanitization.
+    Recursively removes common bullet points, invisible control characters,
+    and standardized formatting to recover valid addresses from dirty datasets.
+    """
+    if not email or not isinstance(email, str):
+        return ""
+
+    # 1. Strip basic whitespace and invisible control characters
+    email = email.strip()
+    
+    # 2. Handle bracketed formats: "Name <email@domain.com>" -> "email@domain.com"
+    if "<" in email and ">" in email:
+        match = re.search(r'<(.*?)>', email)
+        if match:
+            email = match.group(1)
+
+    # 3. Recursively remove common bullet/list prefixes: "- ", "* ", "1. ", etc.
+    # We do this character-by-character to handle nested garbage like "- * • email@..."
+    garbage_prefixes = "-*•+.:/ \t\n\r#|~"
+    while email and email[0] in garbage_prefixes:
+        email = email[1:].strip()
+        
+    # 4. Standardize to lowercase and final strip
+    return email.lower().strip()
+
+
+def _validate_email_format(email: str) -> bool:
+    """Return True if the email address is syntactically valid."""
+    if not email:
+        return False
+    return bool(_EMAIL_RE.match(email))
+
+
+def _classify_bounce(exc: Exception) -> str:
+    """
+    Classify an SMTP exception into a bounce type.
+
+    Returns:
+        'hard'    — permanent rejection (address gone, never retry)
+        'soft'    — temporary failure (mailbox full, server busy)
+        'invalid' — should not be reached here (handled before send)
+    """
+    error_str = str(exc).lower()
+    smtp_code = getattr(exc.__cause__, "smtp_code", 0) or 0
+
+    if isinstance(exc, SMTPPermanentError):
+        # 4xx codes mis-classified as permanent by Gmail rate limiting
+        # — treat as soft (recipient may accept tomorrow)
+        if smtp_code in (421, 450):
+            return "soft"
+        # 5xx codes + hard-bounce phrases → permanent address failure
+        if smtp_code in _HARD_BOUNCE_CODES or any(
+            phrase in error_str for phrase in _HARD_BOUNCE_PHRASES
+        ):
+            return "hard"
+        # Unknown permanent error — default to hard (don't keep retrying)
+        return "hard"
+
+    # SMTPTransientError or any other exception → temporary failure
+    if isinstance(exc, SMTPTransientError):
+        return "soft"
+    return "soft"
 
 
 def _update_campaign_email_status(
     campaign_email_id: int,
     status: str,
-    error_message: str = None,
+    error_message: Optional[str] = None,
+    bounce_type: Optional[str] = None,
 ) -> None:
     """
     Update a campaign_emails row via the REST API PUT endpoint.
@@ -42,10 +132,6 @@ def _update_campaign_email_status(
             f"{settings.api_url}"
             f"/campaign-emails/{campaign_email_id}"
         )
-        headers = (
-            {"Authorization": f"Bearer {settings.api_bearer_token}"}
-            if settings.api_bearer_token else {}
-        )
 
         body: Dict[str, Any] = {
             "status": status,
@@ -53,12 +139,14 @@ def _update_campaign_email_status(
         }
         if error_message:
             body["error_message"] = error_message[:500]
+        if bounce_type:
+            body["bounce_type"] = bounce_type
 
         with httpx.Client() as client:
             resp = client.put(
                 url,
                 json=body,
-                headers=headers,
+                auth=APIAuth(),
                 timeout=10.0,
             )
             resp.raise_for_status()
@@ -87,11 +175,7 @@ def _increment_credential_sent(
     try:
         url = (
             f"{settings.api_url}"
-            f"/orchestrator/workflows/{workflow_id}/execute-reset-sql"
-        )
-        headers = (
-            {"Authorization": f"Bearer {settings.api_bearer_token}"}
-            if settings.api_bearer_token else {}
+            f"/credentials/{credential_id}/increment-sent"
         )
         
         body = {
@@ -110,8 +194,8 @@ def _increment_credential_sent(
         with httpx.Client() as client:
             resp = client.post(
                 url,
-                json=body,
-                headers=headers,
+                json={"workflow_id": workflow_id},
+                auth=APIAuth(),
                 timeout=10.0,
             )
             resp.raise_for_status()
@@ -196,7 +280,10 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Sends one outreach email via SMTP and updates campaign_emails status.
     """
-    vendor_email = payload.get("vendor_email")
+    # ── 0. Enterprise Sanitization ────────────────────────────────
+    # Recovers emails from dirty data (hyphens, bullet points, brackets, etc.)
+    vendor_email = _sanitize_email(payload.get("vendor_email"))
+
     campaign_email_id = payload.get("campaign_email_id")
     credential = payload.get("credential", {})
     variables = payload.get("variables", {})
@@ -207,6 +294,25 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("worker_started", vendor_email=vendor_email)
 
     try:
+        # ── 0. Validate email format BEFORE attempting send ────────
+        if not _validate_email_format(vendor_email):
+            logger.warning(
+                "worker_invalid_email",
+                vendor_email=vendor_email,
+            )
+            _update_campaign_email_status(
+                campaign_email_id=campaign_email_id,
+                status="bounced",
+                bounce_type="invalid",
+                error_message=f"Invalid email format: {vendor_email}",
+            )
+            _try_send_deferred_report(log_id=log_id, success=False)
+            return {
+                "success": False,
+                "error": "invalid_email_format",
+                "vendor_email": vendor_email,
+            }
+
         # Ensure template variables are populated
         variables["vendor_email"] = vendor_email
         variables["recipient_email"] = vendor_email
@@ -263,27 +369,31 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": True, "vendor_email": vendor_email}
 
     except SMTPPermanentError as e:
-        # ── Gmail permanently blocked this message — do NOT retry ──
+        # ── Permanent SMTP failure — classify and do NOT retry ─────
+        bounce = _classify_bounce(e)
         logger.error(
-            "worker_permanent_block",
+            "worker_permanent_bounce",
             error=str(e),
+            bounce_type=bounce,
             vendor_email=vendor_email,
         )
         _update_campaign_email_status(
             campaign_email_id=campaign_email_id,
-            status="failed",
-            error_message=f"Permanent block: {str(e)[:400]}",
+            status="bounced",
+            bounce_type=bounce,
+            error_message=str(e)[:400],
         )
         _try_send_deferred_report(log_id=log_id, success=False)
         return {
             "success": False,
             "error": str(e),
-            "permanent_block": True,
+            "bounce_type": bounce,
         }
 
     except Exception as e:
+        # ── Transient failure — retry via Celery ──────────────────
         logger.error(
-            "worker_error",
+            "worker_transient_error",
             error=str(e),
             vendor_email=vendor_email,
             exc_info=True,
@@ -292,18 +402,17 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             raise self.retry(exc=e)
         except self.MaxRetriesExceededError:
-            # Mark permanently failed after all retries exhausted
+            # All retries exhausted — classify as soft bounce
             _update_campaign_email_status(
                 campaign_email_id=campaign_email_id,
-                status="failed",
-                error_message=str(e),
+                status="bounced",
+                bounce_type="soft",
+                error_message=str(e)[:400],
             )
-
-            # ── Increment Redis counter; send report if last task ──
             _try_send_deferred_report(log_id=log_id, success=False)
-
             return {
                 "success": False,
                 "error": str(e),
+                "bounce_type": "soft",
                 "retries_exceeded": True,
             }

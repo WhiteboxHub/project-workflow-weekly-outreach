@@ -16,6 +16,7 @@ Usage:
 import argparse
 import time
 import sys
+import datetime
 from pathlib import Path
 
 # Add app directory to path
@@ -24,6 +25,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from app.core.logging import configure_logging, get_logger
 from app.scheduler import run_scheduler
 from app.core.config import settings
+from app.core.redis_client import get_redis
+import run_daily_report
 
 # Configure logging
 configure_logging()
@@ -95,6 +98,19 @@ def _run_scheduler_continuously(interval_seconds: int) -> None:
             _run_scheduler_once()
         except Exception as e:
             logger.error("scheduler_run_error", error=str(e), exc_info=True)
+
+        # Check and trigger daily report at or after 6 PM (18:00)
+        try:
+            now = datetime.datetime.now()
+            if now.hour >= 18:
+                today_str = now.strftime("%Y-%m-%d")
+                r = get_redis()
+                # SET NX ensures the report runs exactly once per day, even across restarts
+                if r.set(f"outreach:daily_report:{today_str}", "1", nx=True, ex=172800):
+                    logger.info("triggering_daily_report_auto", date=today_str)
+                    run_daily_report.main()
+        except Exception as e:
+            logger.error("daily_report_trigger_error", error=str(e), exc_info=True)
 
         # Calculate sleep time to maintain interval
         elapsed = time.time() - start_time

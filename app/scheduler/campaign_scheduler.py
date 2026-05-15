@@ -15,8 +15,9 @@ import uuid
 from typing import Dict, Any
 
 import httpx
-from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.config import settings
+from app.core.auth import APIAuth
 from app.core.redis_client import (
     store_run_metadata,
     update_pending_remaining,
@@ -49,39 +50,6 @@ def _calculate_daily_limit(cred: Dict[str, Any]) -> int:
 
 
 
-def _refresh_token(client: httpx.Client) -> str:
-    """
-    Attempt to fetch a fresh JWT by logging into the backend.
-    Requires API_LOGIN_EMAIL and API_LOGIN_PASSWORD in .env.
-    Returns the new token string, or None if login is not configured
-    or the login request fails.
-    """
-    if not settings.api_login_email or not settings.api_login_password:
-        return None
-    try:
-        resp = client.post(
-            settings.api_login_path,
-            json={
-                "email": settings.api_login_email,
-                "password": settings.api_login_password,
-            },
-            timeout=15.0,
-        )
-        resp.raise_for_status()
-        token = resp.json().get("access_token")
-        if token:
-            logger.info(
-                "token_refreshed_via_login",
-                email=settings.api_login_email,
-            )
-        return token
-    except Exception as e:
-        logger.error(
-            "token_refresh_failed",
-            error=str(e),
-        )
-        return None
-
 
 def run_scheduler() -> Dict[str, Any]:
     stats: Dict[str, Any] = {
@@ -91,46 +59,15 @@ def run_scheduler() -> Dict[str, Any]:
     }
 
     base_url = settings.api_url
-    headers = {}
-    if settings.api_bearer_token:
-        headers["Authorization"] = f"Bearer {settings.api_bearer_token}"
 
     try:
         with httpx.Client(
-            base_url=base_url, headers=headers, timeout=60.0
+            base_url=base_url, auth=APIAuth(), timeout=60.0
         ) as client:
 
             # ── 1. Pull Due Schedules ──────────────────────────────
             due_resp = client.get("/orchestrator/schedules/due")
 
-            # ── Auto token refresh on 401 ──────────────────────────
-            # If the bearer token has expired, try to log in again
-            # using API_LOGIN_EMAIL + API_LOGIN_PASSWORD from .env.
-            # If those are not set, raise immediately so the error
-            # is obvious in the logs.
-            if due_resp.status_code == 401:
-                new_token = _refresh_token(client)
-                if new_token:
-                    client.headers["Authorization"] = (
-                        f"Bearer {new_token}"
-                    )
-                    logger.warning(
-                        "bearer_token_refreshed",
-                        hint=(
-                            "Update API_BEARER_TOKEN in .env with "
-                            "the new token to avoid re-login on restart"
-                        ),
-                    )
-                    due_resp = client.get("/orchestrator/schedules/due")
-                else:
-                    logger.error(
-                        "bearer_token_expired_no_credentials",
-                        hint=(
-                            "Set API_LOGIN_EMAIL and API_LOGIN_PASSWORD "
-                            "in .env for automatic token refresh"
-                        ),
-                    )
-                    due_resp.raise_for_status()
 
             due_resp.raise_for_status()
             schedules = due_resp.json()
@@ -246,7 +183,7 @@ def run_scheduler() -> Dict[str, Any]:
                     # Show all rotated accounts in the report
                     emails = [c.get("email") for c in smtp_creds if c.get("email")]
                     if len(emails) > 1:
-                        smtp_account = f"Multiple ({len(emails)} Accounts): " + ", ".join(emails)
+                        smtp_account = "Multiple Accounts"
                     elif emails:
                         smtp_account = emails[0]
                     else:

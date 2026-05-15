@@ -4,13 +4,18 @@ A production-ready email outreach service similar to Instantly, built with Pytho
 
 ## Features
 
-- **Multi-account Email Sending**: Support for Gmail API and SMTP
-- **Campaign Management**: Headless multi-step workflows driven completely by API pipelines.
-- **Smart Scheduling**: Mathematically parallel scheduling parsing JSON queues.
-- **Account Rotation**: Dynamically pulls active identities securely from FAPI server lists.
-- **Rate Limiting**: Custom execution rules handled completely natively.
-- **Template Variables**: Personalize emails smoothly using Jinja2 templates via dynamic JSON arguments.
-- **Tracking**: Webhook-based execution sync updates back to Master automation logs remotely.
+- **Multi-account Email Sending**: Support for Gmail API and SMTP with automatic account rotation
+- **Campaign Management**: Headless multi-step workflows driven by API pipelines
+- **Smart Scheduling**: Weekday-only (Mon–Fri) execution with randomized send times to avoid detection
+- **Bounce Tracking**: Automatic classification of `soft`, `hard`, and `invalid` email bounces
+- **Account Rotation**: Dynamically pulls active SMTP credentials from the Orchestrator backend
+- **Rate Limiting**: Per-account daily limits and warmup limits enforced automatically
+- **Template Variables**: Personalized emails via Jinja2 with `candidate_name`, `linkedin_url`, and more
+- **Autonomous Authentication**: Built-in TokenManager with Redis caching that auto-recovers from 401s
+- **DuckDB Analytics**: Nightly export of campaign data to Parquet files with delivery and bounce reports
+- **Automated Daily Reports**: Sends consolidated daily HTML performance reports via SMTP
+- **Suppression List**: Hard bounce and invalid emails auto-exported to CSV — never contacted again
+- **Trigger Automation**: MySQL triggers auto-schedule campaigns when `run_outreach_emails` flag is set
 
 ## Architecture
 
@@ -35,23 +40,29 @@ A production-ready email outreach service similar to Instantly, built with Pytho
 ## Project Structure
 
 ```
-email-outreach-program/
+Project-Weekly-Outreach/
 ├── app/
-│   ├── core/              # Core configuration and logging wrappers
-│   ├── scheduler/         # Application Scheduler API Proxy
+│   ├── analytics/             # DuckDB analytics pipeline
+│   │   ├── exporter.py        # Fetches campaign data → Parquet files
+│   │   └── queries.py         # DuckDB reports (bounce, suppression, health)
+│   ├── core/                  # Config, logging, Redis client
+│   ├── scheduler/             # Campaign scheduler (polls /orchestrator/schedules/due)
 │   │   └── campaign_scheduler.py
-│   ├── workers/           # Celery execution workers
+│   ├── workers/               # Celery email workers
 │   │   ├── celery_app.py
-│   │   └── email_worker.py
-│   ├── services/          # Abstracted SMTP execution
+│   │   └── email_worker.py    # Sends email, classifies bounces, updates API
+│   ├── services/              # SMTP execution layer
 │   │   └── email_service.py
-│   └── integrations/      # External service clients
+│   └── integrations/          # External service clients
 │       ├── gmail_client.py
 │       └── smtp_client.py
-├── run_scheduler.py       # Scheduler entry point
-├── requirements.txt       # Python dependencies
-├── .env.example          # Environment variables template
-└── README.md             # This file
+├── run_scheduler.py           # Scheduler entry point (also triggers Daily Reports at 6PM)
+├── run_analytics.py           # Analytics export + DuckDB report entry point
+├── run_daily_report.py        # Automated Daily HTML SMTP report execution
+├── data/analytics/            # Parquet files + suppression CSV (auto-created)
+├── requirements.txt
+├── .env.example
+└── README.md
 ```
 
 ## Setup
@@ -67,7 +78,7 @@ email-outreach-program/
 1. Clone the repository and install dependencies:
 
 ```bash
-cd email-outreach-program
+cd Project-Weekly-Outreach
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
@@ -82,12 +93,17 @@ cp .env.example .env
 3. Update `.env` with your configuration mapping to external architectures natively:
 
 ```env
-MAIN_API_BASE_URL=http://localhost:8000
-API_BEARER_TOKEN=put_your_secure_secret_token_here
+MAIN_API_BASE_URL=http://localhost:8000/api
+API_LOGIN_EMAIL=admin@example.com
+API_LOGIN_PASSWORD=secure_password
+API_LOGIN_PATH=/login
 REDIS_URL=redis://localhost:6379/0
-GOOGLE_CLIENT_ID=your-client-id
-GOOGLE_CLIENT_SECRET=your-client-secret
-SECRET_KEY=your-secret-key
+
+# Optional Reporting Overrides
+REPORT_SMTP_HOST=smtp.gmail.com
+REPORT_FROM_EMAIL=reports@example.com
+REPORT_FROM_PASSWORD=app_password
+REPORT_RECIPIENT_EMAIL=admin@example.com
 ```
 
 ## Running the Service
@@ -104,6 +120,9 @@ redis-server
 ```bash
 celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
 ```
+#for windows
+celery -A app.workers.celery_app worker --loglevel=info --pool=solo 
+
 
 For production with monitoring:
 
@@ -252,6 +271,80 @@ Check Celery workers:
 ```bash
 celery -A app.workers.celery_app inspect active
 celery -A app.workers.celery_app inspect stats
+```
+
+## Analytics & Bounce Tracking
+
+### How Bounce Classification Works
+
+The worker classifies every email failure at send time:
+
+| Failure | `status` | `bounce_type` | Action |
+|---|---|---|---|
+| Malformed email address | `bounced` | `invalid` | Never retry, add to suppression |
+| SMTP 5xx (address gone) | `bounced` | `hard` | Never retry, add to suppression |
+| SMTP 4xx (temp failure) | `bounced` | `soft` | Retryable (up to 3x via Celery) |
+| All retries exhausted | `bounced` | `soft` | Add to retryable list |
+| Delivered | `sent` | `none` | — |
+
+### Running Analytics
+
+Export all campaign data and view reports:
+
+```bash
+python run_analytics.py
+```
+
+This single command:
+1. Fetches all `sent / failed / bounced` records from the Orchestrator API
+2. Saves them as a dated Parquet file in `./data/analytics/`
+3. Runs DuckDB queries and prints reports to the console
+4. Exports `./data/suppression_list.csv` automatically
+
+**Filter to one candidate:**
+
+```bash
+python run_analytics.py --candidate-id 570
+```
+
+**Report only (use existing Parquet files, no API call):**
+
+```bash
+python run_analytics.py --report-only
+```
+
+### Reports Generated
+
+| Report | What it shows |
+|---|---|
+| Bounce Summary | Delivered / soft / hard / invalid per candidate |
+| Campaign Progress | Sent / failed / pending per candidate |
+| SMTP Account Health | Delivery rate per account |
+| Daily Send Volume | Emails sent per account per day |
+| Soft Bounce Retryable | Soft bounces with retry budget remaining |
+| Suppression List | Hard + invalid — never contact again |
+
+### Suppression List CSV
+
+Automatically written to `./data/suppression_list.csv` on every run.
+Import into any email platform or use to update a MySQL suppression table.
+
+### Verifying Bounce Data in MySQL
+
+```sql
+-- Check bounce breakdown for a candidate
+SELECT status, bounce_type, COUNT(*) AS count
+FROM campaign_emails
+WHERE candidate_id = 570
+GROUP BY status, bounce_type
+ORDER BY status, bounce_type;
+
+-- View suppression candidates (hard + invalid)
+SELECT vendor_email, bounce_type, error_message, last_attempt_at
+FROM campaign_emails
+WHERE bounce_type IN ('hard', 'invalid')
+ORDER BY last_attempt_at DESC
+LIMIT 20;
 ```
 
 ## Production Considerations
