@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     report_from_password: Optional[str] = None   # App password
     report_recipient_email: Optional[str] = None  # Admin inbox
 
+    # Local DuckDB Campaigns (experimental)
+    use_local_duckdb_campaigns: bool = False
+    duckdb_campaign_path: str = "./data/campaigns.duckdb"
+
     @property
     def api_url(self) -> str:
         """Get the base URL properly stripped of trailing slashes."""

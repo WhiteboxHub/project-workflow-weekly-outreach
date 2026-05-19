@@ -44,14 +44,63 @@ TERMINAL_STATUSES = ["sent", "failed", "bounced"]
 
 
 
+def _fetch_local_campaign_records() -> list[dict]:
+    """
+    Query local DuckDB for today's campaign attempts.
+
+    Transforms local campaign_email_attempts to match remote API schema
+    for compatibility with _aggregate() function.
+    """
+    from app.localdb.duckdb_client import DuckDBClient
+
+    today = date.today()
+
+    try:
+        with DuckDBClient() as db_client:
+            records = db_client.fetch_all("""
+                SELECT
+                    c.candidate_id,
+                    c.candidate_name,
+                    a.status,
+                    a.bounce_type,
+                    a.sent_at as last_attempt_at
+                FROM campaign_email_attempts a
+                JOIN campaigns c ON a.campaign_id = c.id
+                WHERE (DATE(a.sent_at) = ? OR DATE(a.created_at) = ?)
+                  AND a.status IN ('sent', 'failed', 'bounced')
+            """, {"1": today, "2": today})
+
+            # Transform to match remote schema
+            transformed = []
+            for row in records:
+                transformed.append({
+                    "candidate_id": row.get("candidate_id"),
+                    "candidate_name": row.get("candidate_name"),
+                    "status": row.get("status"),
+                    "bounce_type": row.get("bounce_type", "none"),
+                    "last_attempt_at": (
+                        row.get("last_attempt_at").isoformat()
+                        if row.get("last_attempt_at") else ""
+                    ),
+                })
+
+            logger.info("daily_report_local_fetched", total=len(transformed))
+            return transformed
+
+    except Exception as e:
+        logger.error("daily_report_local_fetch_failed", error=str(e))
+        return []
+
+
 def _fetch_todays_records() -> list[dict]:
     """
-    Fetch all terminal campaign_emails updated today from the API.
-    Paginates through all statuses and filters to today's date.
+    Fetch all terminal campaign_emails updated today from both
+    remote API and local DuckDB (if enabled).
     """
     today = date.today().isoformat()
     all_records: list[dict] = []
 
+    # Fetch from remote API
     for status in TERMINAL_STATUSES:
         offset = 0
         while True:
@@ -89,7 +138,19 @@ def _fetch_todays_records() -> list[dict]:
                 break
             offset += PAGE_SIZE
 
-    logger.info("daily_report_fetched", total=len(all_records), date=today)
+    # Fetch from local DuckDB if enabled
+    if settings.use_local_duckdb_campaigns:
+        local_records = _fetch_local_campaign_records()
+        all_records.extend(local_records)
+        logger.info(
+            "daily_report_combined",
+            remote=len(all_records) - len(local_records),
+            local=len(local_records),
+            total=len(all_records)
+        )
+    else:
+        logger.info("daily_report_fetched", total=len(all_records), date=today)
+
     return all_records
 
 

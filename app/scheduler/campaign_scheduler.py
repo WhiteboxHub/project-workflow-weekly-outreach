@@ -13,6 +13,7 @@ Flow per schedule:
 import random
 import uuid
 from typing import Dict, Any
+from datetime import date
 
 import httpx
 from app.core.logging import get_logger
@@ -38,7 +39,6 @@ def _calculate_daily_limit(cred: Dict[str, Any]) -> int:
         daily_cap = int(cred.get("daily_limit") or 50)
 
     # Reset logic: if last_reset_date != today, current_day_sent is stale → treat as 0
-    from datetime import date
     last_reset = cred.get("last_reset_date")
     if last_reset and str(last_reset) != str(date.today()):
         already_sent = 0
@@ -47,6 +47,223 @@ def _calculate_daily_limit(cred: Dict[str, Any]) -> int:
 
     remaining = max(0, daily_cap - already_sent)
     return remaining
+
+
+def _run_local_campaign_schedule(
+    client: httpx.Client,
+    schedule: Dict[str, Any],
+    run_id: str,
+    log_id: int,
+) -> int:
+    """
+    Handle schedule using local DuckDB campaign execution.
+
+    Flow:
+    1. Initialize LocalCampaignService
+    2. create_or_resume_campaign() → get campaign_id
+    3. If new campaign:
+       - create_default_steps()
+       - enroll_recipients()
+       - update_remote_run_parameters()
+    4. generate_due_attempts() → create pending attempts
+    5. Fetch SMTP credentials and calculate daily limit
+    6. claim_attempts(limit=daily_limit) → get batch
+    7. For each attempt: build payload with mode='local_duckdb_campaign', enqueue Celery task
+    8. Store run metadata in Redis (for deferred reporting)
+    9. Update run log with records_processed count
+
+    Args:
+        client: httpx client
+        schedule: Schedule dict from API
+        run_id: Unique run ID
+        log_id: Run log ID
+
+    Returns:
+        Number of emails enqueued
+    """
+    from app.localdb.duckdb_client import DuckDBClient
+    from app.services.local_campaign_service import LocalCampaignService
+    from app.workers.email_worker import send_outreach_email
+
+    sched_id = schedule.get("id")
+    wf_id = schedule.get("automation_workflow_id")
+    run_params = schedule.get("run_parameters") or {}
+    candidate_id = run_params.get("candidate_id")
+
+    # Extract required identity vars
+    candidate_name = run_params.get("candidate_name")
+    linkedin_url = run_params.get("linkedin_url")
+
+    if not candidate_name or not linkedin_url:
+        raise ValueError(
+            f"Missing required identity variables (candidate_name or linkedin_url) "
+            f"in schedule run_parameters for candidate {candidate_id}. "
+            "Aborting local campaign dispatch."
+        )
+
+    # Initialize DuckDB client and service
+    with DuckDBClient() as db_client:
+        service = LocalCampaignService(db_client, client)
+
+        # Create or resume campaign
+        campaign_id = service.create_or_resume_campaign(
+            schedule_id=sched_id,
+            candidate_id=candidate_id,
+            candidate_name=candidate_name,
+            workflow_id=wf_id,
+            run_parameters=run_params
+        )
+
+        # Check if campaign is new (not in run_parameters)
+        is_new_campaign = not run_params.get("local_campaign_id")
+
+        if is_new_campaign:
+            # Create default weekly sequence steps
+            service.create_default_steps(campaign_id)
+
+            # Enroll recipients from remote API
+            service.enroll_recipients(campaign_id, candidate_id)
+
+            # Write local_campaign_id back to remote
+            service.update_remote_run_parameters(sched_id, campaign_id)
+
+        # Generate due attempts for recipients with next_send_at <= NOW()
+        service.generate_due_attempts(campaign_id)
+
+        # Fetch execution bundle for template and credentials
+        bundle_resp = client.get(f"/automation-workflow/{wf_id}/execution-bundle")
+        bundle_resp.raise_for_status()
+        bundle = bundle_resp.json()
+
+        template = bundle.get("template", {})
+        smtp_creds = bundle.get("smtp_credentials") or []
+
+        # Fallback: fetch creds directly by candidate
+        if not smtp_creds:
+            cred_resp = client.get(f"/orchestrator/candidate-credentials/{candidate_id}")
+            if cred_resp.is_success:
+                cred_data = cred_resp.json()
+                smtp_creds = cred_data if isinstance(cred_data, list) else [cred_data]
+
+        # Filter only healthy & active credentials
+        smtp_creds = [
+            c for c in smtp_creds
+            if c.get("is_active") and c.get("is_healthy", True)
+        ]
+
+        if not smtp_creds:
+            raise ValueError(f"No active healthy SMTP credentials for candidate {candidate_id}")
+
+        # Show all rotated accounts in the report
+        emails = [c.get("email") for c in smtp_creds if c.get("email")]
+        smtp_account = "Multiple Accounts" if len(emails) > 1 else (emails[0] if emails else "unknown@smtp")
+
+        # Calculate total daily limit (all accounts)
+        total_limit = sum(_calculate_daily_limit(c) for c in smtp_creds)
+
+        if total_limit == 0:
+            logger.info(
+                "daily_limit_reached",
+                campaign_id=campaign_id,
+                candidate_id=candidate_id,
+                smtp_account=smtp_account,
+            )
+            if log_id:
+                client.put(
+                    f"/orchestrator/logs/{log_id}",
+                    json={
+                        "status": "success",
+                        "records_processed": 0,
+                        "error_summary": "Daily limit reached",
+                    }
+                )
+            return 0
+
+        # Claim pending attempts atomically
+        claimed_attempts = service.claim_attempts(campaign_id, total_limit, "scheduler")
+
+        if not claimed_attempts:
+            logger.info(
+                "no_pending_attempts",
+                campaign_id=campaign_id,
+                candidate_id=candidate_id
+            )
+            if log_id:
+                client.put(
+                    f"/orchestrator/logs/{log_id}",
+                    json={
+                        "status": "success",
+                        "records_processed": 0,
+                        "error_summary": "No pending attempts",
+                    }
+                )
+            return 0
+
+        # Store run metadata in Redis BEFORE dispatching tasks
+        target_count = len(claimed_attempts)
+        report_stored = store_run_metadata(
+            log_id=log_id,
+            total=target_count,
+            candidate_name=candidate_name,
+            candidate_id=int(candidate_id),
+            smtp_account=smtp_account,
+            pending_remaining=0,
+        )
+
+        # Build & enqueue Celery tasks
+        for idx, attempt in enumerate(claimed_attempts):
+            # Round-robin across SMTP accounts
+            cred = smtp_creds[idx % len(smtp_creds)]
+
+            payload = {
+                "mode": "local_duckdb_campaign",
+                "attempt_id": attempt["attempt_id"],
+                "campaign_id": campaign_id,
+                "recipient_id": attempt["recipient_id"],
+                "step_number": attempt["step_number"],
+                "vendor_email": attempt["vendor_email"],
+                "workflow_id": wf_id,
+                "candidate_id": candidate_id,
+                "log_id": log_id,
+                "credential": cred,
+                "template_subject": template.get("subject", ""),
+                "template_body_html": template.get("content_html", ""),
+                "variables": {
+                    **run_params,
+                    "candidate_name": candidate_name,
+                    "linkedin_url": linkedin_url,
+                    "vendor_email": attempt["vendor_email"],
+                    "recipient_email": attempt["vendor_email"],
+                },
+            }
+
+            delay = random.randint(
+                settings.min_delay_seconds,
+                settings.max_delay_seconds,
+            )
+            send_outreach_email.apply_async(
+                kwargs={"payload": payload},
+                countdown=delay,
+            )
+
+        logger.info(
+            "local_campaign_tasks_enqueued",
+            campaign_id=campaign_id,
+            count=target_count,
+            candidate_id=candidate_id
+        )
+
+        # Update run log
+        if log_id:
+            client.put(
+                f"/orchestrator/logs/{log_id}",
+                json={
+                    "status": "success",
+                    "records_processed": target_count,
+                }
+            )
+
+        return target_count
 
 
 
@@ -121,6 +338,17 @@ def run_scheduler() -> Dict[str, Any]:
                     })
                     log_resp.raise_for_status()
                     log_id = log_resp.json().get("id")
+
+                    # ── FEATURE FLAG: Local DuckDB Campaign ─────────
+                    if settings.use_local_duckdb_campaigns:
+                        enqueued = _run_local_campaign_schedule(
+                            client=client,
+                            schedule=schedule,
+                            run_id=run_id,
+                            log_id=log_id
+                        )
+                        stats["emails_enqueued"] += enqueued
+                        continue  # Skip remote flow
 
                     # ── 4. Fetch execution bundle ──────────────────
                     bundle_resp = client.get(

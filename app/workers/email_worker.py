@@ -270,6 +270,243 @@ def _try_send_deferred_report(
         )
 
 
+def _send_local_campaign_email(task, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Send email for local DuckDB campaign and update local tables.
+
+    Payload structure:
+    {
+        "mode": "local_duckdb_campaign",
+        "attempt_id": int,
+        "campaign_id": int,
+        "recipient_id": int,
+        "step_number": int,
+        "vendor_email": str,
+        "credential": {...},
+        "template_subject": str,
+        "template_body_html": str,
+        "variables": {...},
+        "log_id": int,
+    }
+    """
+    from datetime import date
+    from app.localdb.duckdb_client import DuckDBClient
+    from app.services.local_campaign_service import LocalCampaignService
+    from app.core.auth import APIAuth
+    import httpx
+
+    # Extract payload fields
+    attempt_id = payload.get("attempt_id")
+    campaign_id = payload.get("campaign_id")
+    recipient_id = payload.get("recipient_id")
+    vendor_email = _sanitize_email(payload.get("vendor_email"))
+    credential = payload.get("credential", {})
+    variables = payload.get("variables", {})
+    log_id = payload.get("log_id")
+    credential_id = credential.get("id")
+
+    logger.info(
+        "local_campaign_worker_started",
+        campaign_id=campaign_id,
+        recipient_id=recipient_id,
+        attempt_id=attempt_id,
+        vendor_email=vendor_email
+    )
+
+    try:
+        # Validate email format
+        if not _validate_email_format(vendor_email):
+            logger.warning(
+                "local_campaign_invalid_email",
+                vendor_email=vendor_email,
+                recipient_id=recipient_id
+            )
+
+            with DuckDBClient() as db_client:
+                # Update attempt status
+                db_client.execute_query("""
+                    UPDATE campaign_email_attempts
+                    SET status = 'bounced',
+                        bounce_type = 'invalid',
+                        error_message = ?,
+                        sent_at = ?
+                    WHERE id = ?
+                """, {
+                    "1": f"Invalid email format: {vendor_email}",
+                    "2": datetime.utcnow(),
+                    "3": attempt_id
+                })
+
+                # Initialize service and mark recipient bounced
+                with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
+                    service = LocalCampaignService(db_client, api_client)
+                    service.mark_recipient_bounced(recipient_id, "invalid")
+                    service.update_daily_metrics(
+                        campaign_id, date.today(),
+                        bounced=1, bounce_type="invalid"
+                    )
+
+            _try_send_deferred_report(log_id=log_id, success=False)
+            return {
+                "success": False,
+                "error": "invalid_email_format",
+                "vendor_email": vendor_email,
+                "mode": "local_duckdb_campaign"
+            }
+
+        # Ensure template variables are populated
+        variables["vendor_email"] = vendor_email
+        variables["recipient_email"] = vendor_email
+
+        # Send email
+        email_service = EmailService()
+        smtp_host = credential.get("smtp_host") or f"smtp.{credential.get('email', 'gmail.com').split('@')[-1]}"
+
+        email_service.send_outreach(
+            smtp_host=smtp_host,
+            from_email=credential.get("email"),
+            from_name=credential.get("email").split("@")[0],
+            password=credential.get("app_password") or credential.get("password"),
+            to_email=vendor_email,
+            template_subject=payload.get("template_subject"),
+            template_body_html=payload.get("template_body_html"),
+            variables=variables,
+        )
+
+        # Success: update local status
+        with DuckDBClient() as db_client:
+            # Update attempt status
+            db_client.execute_query("""
+                UPDATE campaign_email_attempts
+                SET status = 'sent',
+                    sent_at = ?
+                WHERE id = ?
+            """, {"1": datetime.utcnow(), "2": attempt_id})
+
+            # Initialize service and advance recipient
+            with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
+                service = LocalCampaignService(db_client, api_client)
+                service.advance_recipient(recipient_id, campaign_id)
+                service.update_daily_metrics(
+                    campaign_id, date.today(), sent=1
+                )
+
+        # Increment SMTP credential counter
+        _increment_credential_sent(credential_id, payload.get("workflow_id"))
+
+        # Try deferred report
+        _try_send_deferred_report(log_id=log_id, success=True)
+
+        logger.info(
+            "local_campaign_email_sent_successfully",
+            campaign_id=campaign_id,
+            recipient_id=recipient_id,
+            vendor_email=vendor_email
+        )
+
+        return {
+            "success": True,
+            "vendor_email": vendor_email,
+            "mode": "local_duckdb_campaign"
+        }
+
+    except SMTPPermanentError as e:
+        # Permanent bounce (hard)
+        bounce_type = _classify_bounce(e)
+        error_msg = str(e)[:500]
+
+        logger.error(
+            "local_campaign_permanent_bounce",
+            vendor_email=vendor_email,
+            recipient_id=recipient_id,
+            bounce_type=bounce_type,
+            error=error_msg
+        )
+
+        with DuckDBClient() as db_client:
+            # Update attempt status
+            db_client.execute_query("""
+                UPDATE campaign_email_attempts
+                SET status = 'bounced',
+                    bounce_type = ?,
+                    error_message = ?,
+                    sent_at = ?
+                WHERE id = ?
+            """, {
+                "1": bounce_type,
+                "2": error_msg,
+                "3": datetime.utcnow(),
+                "4": attempt_id
+            })
+
+            # Mark recipient bounced
+            with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
+                service = LocalCampaignService(db_client, api_client)
+                service.mark_recipient_bounced(recipient_id, bounce_type)
+                service.update_daily_metrics(
+                    campaign_id, date.today(),
+                    bounced=1, bounce_type=bounce_type
+                )
+
+        _try_send_deferred_report(log_id=log_id, success=False)
+
+        return {
+            "success": False,
+            "error": error_msg,
+            "bounce_type": bounce_type,
+            "mode": "local_duckdb_campaign"
+        }
+
+    except Exception as e:
+        # Transient error - retry via Celery
+        logger.warning(
+            "local_campaign_transient_error",
+            vendor_email=vendor_email,
+            recipient_id=recipient_id,
+            error=str(e),
+            attempt=task.request.retries
+        )
+
+        try:
+            raise task.retry(exc=e)
+        except task.MaxRetriesExceededError:
+            # All retries exhausted - mark as soft bounce
+            error_msg = str(e)[:500]
+
+            with DuckDBClient() as db_client:
+                # Update attempt status
+                db_client.execute_query("""
+                    UPDATE campaign_email_attempts
+                    SET status = 'bounced',
+                        bounce_type = 'soft',
+                        error_message = ?,
+                        sent_at = ?
+                    WHERE id = ?
+                """, {
+                    "1": error_msg,
+                    "2": datetime.utcnow(),
+                    "3": attempt_id
+                })
+
+                # Update metrics (soft bounce, keep recipient active)
+                with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
+                    service = LocalCampaignService(db_client, api_client)
+                    service.update_daily_metrics(
+                        campaign_id, date.today(),
+                        bounced=1, bounce_type="soft"
+                    )
+
+            _try_send_deferred_report(log_id=log_id, success=False)
+
+            return {
+                "success": False,
+                "error": error_msg,
+                "bounce_type": "soft",
+                "retries_exceeded": True,
+                "mode": "local_duckdb_campaign"
+            }
+
+
 @celery_app.task(
     bind=True,
     name="send_outreach_email",
@@ -279,7 +516,18 @@ def _try_send_deferred_report(
 def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Sends one outreach email via SMTP and updates campaign_emails status.
+
+    Supports dual modes:
+    - remote: existing remote API flow (default)
+    - local_duckdb_campaign: new local DuckDB campaign flow
     """
+    # Detect mode
+    mode = payload.get("mode", "remote")
+
+    if mode == "local_duckdb_campaign":
+        return _send_local_campaign_email(self, payload)
+
+    # ── REMOTE MODE (existing flow) ────────────────────────────────
     # ── 0. Enterprise Sanitization ────────────────────────────────
     # Recovers emails from dirty data (hyphens, bullet points, brackets, etc.)
     vendor_email = _sanitize_email(payload.get("vendor_email"))

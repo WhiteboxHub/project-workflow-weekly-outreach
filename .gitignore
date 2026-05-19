@@ -1,6 +1,142 @@
+# Environment variables
 .env
-venv/
-__pycache__/
-*.pyc
-__MACOSX__
+.env.local
+.env.*.local
 
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+.virtualenv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# DuckDB databases (local campaigns)
+*.duckdb
+*.duckdb.wal
+data/campaigns.duckdb
+data/campaigns.backup.duckdb
+
+# Analytics data
+data/analytics/*.parquet
+data/analytics/*.csv
+data/suppression_list.csv
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+__MACOSX__
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Redis
+dump.rdb
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+
+# Sensitive data
+credentials.json
+service-account-key.json
+*.key
+*.pem
+*.p12
+
+# Docker
+.dockerignore
+
+# Node modules (if any JS tooling)
+node_modules/
+
+# Misc
+.scratch/
+TODO.md
+NOTES.md
