@@ -83,6 +83,54 @@ class CampaignEmailExporter:
             )
             return []
 
+    def _fetch_local_all(self, candidate_id: Optional[int] = None) -> list[dict]:
+        """Fetch all terminal-status attempts from local DuckDB."""
+        if not settings.use_local_duckdb_campaigns:
+            return []
+            
+        from app.localdb.duckdb_client import DuckDBClient
+        
+        try:
+            with DuckDBClient() as db_client:
+                sql = """
+                    SELECT
+                        c.candidate_id,
+                        a.vendor_email,
+                        a.status,
+                        a.bounce_type,
+                        a.error_message,
+                        a.sent_at,
+                        a.created_at,
+                        a.credential_id
+                    FROM campaign_email_attempts a
+                    JOIN campaigns c ON a.campaign_id = c.id
+                    WHERE a.status IN ('sent', 'failed', 'bounced')
+                """
+                params = {}
+                if candidate_id is not None:
+                    sql += " AND c.candidate_id = ?"
+                    params = {"1": candidate_id}
+                
+                records = db_client.fetch_all(sql, params)
+                
+                transformed = []
+                for row in records:
+                    last_ts = row.get("sent_at") or row.get("created_at")
+                    transformed.append({
+                        "candidate_id": row.get("candidate_id"),
+                        "vendor_email": row.get("vendor_email"),
+                        "status": row.get("status"),
+                        "bounce_type": row.get("bounce_type", "none"),
+                        "error_message": row.get("error_message"),
+                        "last_attempt_at": last_ts.isoformat() if last_ts else None,
+                        "credential_id": row.get("credential_id"),
+                        "retry_count": 0,
+                    })
+                return transformed
+        except Exception as e:
+            logger.warning("exporter_local_fetch_failed", error=str(e))
+            return []
+
     def _fetch_all(
         self,
         candidate_id: Optional[int] = None,
@@ -93,7 +141,8 @@ class CampaignEmailExporter:
         Returns a flat list of all records across all statuses.
         """
         all_records: list[dict] = []
-
+        
+        # 1. Fetch remote records
         for status in TERMINAL_STATUSES:
             offset = 0
             while True:
@@ -117,6 +166,18 @@ class CampaignEmailExporter:
                 if len(page) < page_size:
                     break  # Last page
                 offset += page_size
+
+        # 2. Fetch local DuckDB records if enabled
+        if settings.use_local_duckdb_campaigns:
+            local_records = self._fetch_local_all(candidate_id=candidate_id)
+            if local_records:
+                all_records.extend(local_records)
+                logger.info(
+                    "exporter_combined_local_records",
+                    remote=len(all_records) - len(local_records),
+                    local=len(local_records),
+                    total=len(all_records),
+                )
 
         return all_records
 

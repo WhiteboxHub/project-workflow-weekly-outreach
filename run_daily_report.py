@@ -10,15 +10,15 @@ Usage:
     python run_daily_report.py
 
 Schedule via Windows Task Scheduler or cron to run once daily
-at end of business (e.g. 6 PM):
+at end of business (e.g. 5:15 PM):
 
-  # Linux/Mac cron (6 PM daily)
-  0 18 * * * cd /path/to/project && venv/bin/python run_daily_report.py
+  # Linux/Mac cron (5:15 PM daily)
+  15 17 * * * cd /path/to/project && venv/bin/python run_daily_report.py
 
   # Windows Task Scheduler:
   Program : C:\\path\\to\\venv\\Scripts\\python.exe
   Arguments: C:\\path\\to\\project\\run_daily_report.py
-  Trigger  : Daily at 18:00
+  Trigger  : Daily at 17:15
 """
 
 import sys

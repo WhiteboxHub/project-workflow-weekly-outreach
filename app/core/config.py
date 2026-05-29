@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     # Local DuckDB Campaigns (experimental)
     use_local_duckdb_campaigns: bool = False
     duckdb_campaign_path: str = "./data/campaigns.duckdb"
+    stale_claim_minutes: int = 10
 
     @property
     def api_url(self) -> str:

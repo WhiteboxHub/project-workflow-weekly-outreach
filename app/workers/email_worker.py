@@ -8,18 +8,23 @@ When the LAST task for a run finishes, sends the real accurate HTML report.
 Retries up to 3 times with 5-minute delays before giving up.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 import httpx
 
-from app.integrations.smtp_client import SMTPPermanentError, SMTPTransientError
+from app.integrations.smtp_client import SMTPPermanentError, SMTPTransientError, SMTPAuthError, SMTPRateLimitError
 
 from app.workers.celery_app import celery_app
 from app.core.config import settings
 from app.core.auth import APIAuth
 from app.core.logging import get_logger
-from app.core.redis_client import record_task_outcome, claim_report_slot
+from app.core.redis_client import (
+    record_task_outcome,
+    claim_report_slot,
+    mark_credential_rate_limited_redis,
+    is_credential_rate_limited_redis
+)
 from app.services.email_service import EmailService
 from app.services.report_service import send_run_report
 
@@ -91,6 +96,10 @@ def _classify_bounce(exc: Exception) -> str:
         'hard'    — permanent rejection (address gone, never retry)
         'soft'    — temporary failure (mailbox full, server busy)
         'invalid' — should not be reached here (handled before send)
+
+    NOTE: SMTPAuthError is NOT classified here because it is not a bounce
+    at all — it is a credential failure.  Auth errors are handled in their
+    own dedicated except block and marked as 'credential_auth_failure'.
     """
     error_str = str(exc).lower()
     smtp_code = getattr(exc.__cause__, "smtp_code", 0) or 0
@@ -135,7 +144,7 @@ def _update_campaign_email_status(
 
         body: Dict[str, Any] = {
             "status": status,
-            "last_attempt_at": datetime.utcnow().isoformat(),
+            "last_attempt_at": datetime.now(timezone.utc).isoformat(),
         }
         if error_message:
             body["error_message"] = error_message[:500]
@@ -175,9 +184,8 @@ def _increment_credential_sent(
     try:
         url = (
             f"{settings.api_url}"
-            f"/credentials/{credential_id}/increment-sent"
+            f"/orchestrator/workflows/{workflow_id}/execute-reset-sql"
         )
-        
         body = {
             "sql_query": (
                 "UPDATE email_smtp_credentials "
@@ -187,14 +195,14 @@ def _increment_credential_sent(
                 "WHERE id = :credential_id"
             ),
             "parameters": {
-                "credential_id": credential_id
-            }
+                "credential_id": credential_id,
+            },
         }
 
         with httpx.Client() as client:
             resp = client.post(
                 url,
-                json={"workflow_id": workflow_id},
+                json=body,
                 auth=APIAuth(),
                 timeout=10.0,
             )
@@ -280,6 +288,7 @@ def _send_local_campaign_email(task, payload: Dict[str, Any]) -> Dict[str, Any]:
         "attempt_id": int,
         "campaign_id": int,
         "recipient_id": int,
+        "credential_id": int,
         "step_number": int,
         "vendor_email": str,
         "credential": {...},
@@ -288,6 +297,15 @@ def _send_local_campaign_email(task, payload: Dict[str, Any]) -> Dict[str, Any]:
         "variables": {...},
         "log_id": int,
     }
+
+    Recipient lifecycle states:
+      - success          → attempt: sent       | recipient: active (advance step)
+      - rate_limit       → attempt: rate_limited | recipient: deferred (retry tomorrow)
+      - hard_bounce      → attempt: bounced     | recipient: hard_bounce (stop forever)
+      - soft_bounce      → attempt: bounced     | recipient: active (allow retry)
+      - auth_failure     → attempt: failed      | recipient: active (credential broken)
+      - invalid_email    → attempt: bounced     | recipient: invalid (stop forever)
+      - transient error  → Celery retry with exponential backoff (up to 3x)
     """
     from datetime import date
     from app.localdb.duckdb_client import DuckDBClient
@@ -300,30 +318,84 @@ def _send_local_campaign_email(task, payload: Dict[str, Any]) -> Dict[str, Any]:
     campaign_id = payload.get("campaign_id")
     recipient_id = payload.get("recipient_id")
     vendor_email = _sanitize_email(payload.get("vendor_email"))
-    credential = payload.get("credential", {})
     variables = payload.get("variables", {})
     log_id = payload.get("log_id")
-    credential_id = credential.get("id")
+    credential_id = payload.get("credential_id")
+    retry_count = task.request.retries
+
+    # Read the full credential object directly from the payload injected by the scheduler
+    credential = payload.get("credential", {})
+    if not credential and credential_id:
+        # Fallback for payloads already in the queue before the update
+        with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=30.0) as client:
+            resp = client.get(f"/email-smtp-credentials/{credential_id}")
+            if resp.is_success:
+                credential = resp.json()
+
+    if not credential or not credential.get("email"):
+        raise ValueError(f"Failed to load valid SMTP credential for ID {credential_id}")
+
+    # ── Fast-fail: check if this credential was already rate-limited ──────────
+    # If the credential was marked is_healthy=False by a previous task, OR if
+    # it was instantly flagged in Redis by a task running 2 milliseconds ago,
+    # skip immediately without hitting Gmail. This flushes 100s of remaining queued
+    # tasks in milliseconds instead of hammering the provider with blocked requests.
+    is_healthy = credential.get("is_healthy", True)
+    if not is_healthy or is_credential_rate_limited_redis(credential_id):
+        logger.warning(
+            "local_campaign_skipped_unhealthy_credential",
+            campaign_id=campaign_id,
+            recipient_id=recipient_id,
+            attempt_id=attempt_id,
+            credential_id=credential_id,
+            vendor_email=vendor_email,
+            hint="Credential is rate-limited. Recipient deferred to next healthy run.",
+        )
+        with DuckDBClient() as db_client:
+            db_client.execute_query("""
+                UPDATE campaign_email_attempts
+                SET status = 'rate_limited',
+                    error_message = ?,
+                    sent_at = ?
+                WHERE id = ?
+            """, {
+                "1": "Credential marked unhealthy (rate-limited). Deferred to next run.",
+                "2": datetime.now(timezone.utc),
+                "3": attempt_id
+            })
+            with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
+                service = LocalCampaignService(db_client, api_client)
+                service.mark_recipient_deferred(recipient_id)
+                service.update_daily_metrics(campaign_id, date.today(), failed=1)
+
+        _try_send_deferred_report(log_id=log_id, success=False)
+        return {
+            "success": False,
+            "skipped": True,
+            "reason": "credential_rate_limited",
+            "credential_id": credential_id,
+            "mode": "local_duckdb_campaign",
+        }
 
     logger.info(
         "local_campaign_worker_started",
         campaign_id=campaign_id,
         recipient_id=recipient_id,
         attempt_id=attempt_id,
-        vendor_email=vendor_email
+        credential_id=credential_id,
+        vendor_email=vendor_email,
+        retry_count=retry_count,
     )
 
     try:
-        # Validate email format
+        # ── Validate email format BEFORE any SMTP connection ──────────────────
         if not _validate_email_format(vendor_email):
             logger.warning(
                 "local_campaign_invalid_email",
                 vendor_email=vendor_email,
-                recipient_id=recipient_id
+                recipient_id=recipient_id,
             )
-
             with DuckDBClient() as db_client:
-                # Update attempt status
                 db_client.execute_query("""
                     UPDATE campaign_email_attempts
                     SET status = 'bounced',
@@ -333,32 +405,27 @@ def _send_local_campaign_email(task, payload: Dict[str, Any]) -> Dict[str, Any]:
                     WHERE id = ?
                 """, {
                     "1": f"Invalid email format: {vendor_email}",
-                    "2": datetime.utcnow(),
+                    "2": datetime.now(timezone.utc),
                     "3": attempt_id
                 })
-
-                # Initialize service and mark recipient bounced
                 with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
                     service = LocalCampaignService(db_client, api_client)
-                    service.mark_recipient_bounced(recipient_id, "invalid")
-                    service.update_daily_metrics(
-                        campaign_id, date.today(),
-                        bounced=1, bounce_type="invalid"
-                    )
+                    service.update_recipient_status(recipient_id, "invalid")
+                    service.update_daily_metrics(campaign_id, date.today(), bounced=1, bounce_type="invalid")
 
             _try_send_deferred_report(log_id=log_id, success=False)
             return {
                 "success": False,
                 "error": "invalid_email_format",
                 "vendor_email": vendor_email,
-                "mode": "local_duckdb_campaign"
+                "mode": "local_duckdb_campaign",
             }
 
-        # Ensure template variables are populated
+        # ── Populate template variables ───────────────────────────────────────
         variables["vendor_email"] = vendor_email
         variables["recipient_email"] = vendor_email
 
-        # Send email
+        # ── Send email ────────────────────────────────────────────────────────
         email_service = EmailService()
         smtp_host = credential.get("smtp_host") or f"smtp.{credential.get('email', 'gmail.com').split('@')[-1]}"
 
@@ -373,108 +440,196 @@ def _send_local_campaign_email(task, payload: Dict[str, Any]) -> Dict[str, Any]:
             variables=variables,
         )
 
-        # Success: update local status
+        # ── Success path ──────────────────────────────────────────────────────
         with DuckDBClient() as db_client:
-            # Update attempt status
             db_client.execute_query("""
                 UPDATE campaign_email_attempts
                 SET status = 'sent',
                     sent_at = ?
                 WHERE id = ?
-            """, {"1": datetime.utcnow(), "2": attempt_id})
+            """, {"1": datetime.now(timezone.utc), "2": attempt_id})
 
-            # Initialize service and advance recipient
             with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
                 service = LocalCampaignService(db_client, api_client)
                 service.advance_recipient(recipient_id, campaign_id)
-                service.update_daily_metrics(
-                    campaign_id, date.today(), sent=1
-                )
+                service.update_daily_metrics(campaign_id, date.today(), sent=1)
+                # Restore current_day_sent tracking — critical for proactive quota management
+                service.increment_credential_sent(credential_id)
 
-        # Increment SMTP credential counter
-        _increment_credential_sent(credential_id, payload.get("workflow_id"))
-
-        # Try deferred report
         _try_send_deferred_report(log_id=log_id, success=True)
 
         logger.info(
             "local_campaign_email_sent_successfully",
             campaign_id=campaign_id,
             recipient_id=recipient_id,
-            vendor_email=vendor_email
+            credential_id=credential_id,
+            vendor_email=vendor_email,
         )
 
         return {
             "success": True,
             "vendor_email": vendor_email,
-            "mode": "local_duckdb_campaign"
+            "mode": "local_duckdb_campaign",
         }
 
-    except SMTPPermanentError as e:
-        # Permanent bounce (hard)
-        bounce_type = _classify_bounce(e)
+    except SMTPRateLimitError as e:
+        # ── Provider quota / rate-limit hit ───────────────────────────────────
+        # This is a SENDER transport failure — NOT the recipient's fault.
+        # 1. Mark the CREDENTIAL as unhealthy so remaining queued tasks fast-fail.
+        # 2. Mark this RECIPIENT as deferred (retry tomorrow with a healthy account).
+        # 3. Do NOT retry this task — the account won't un-limit for 24 hours.
         error_msg = str(e)[:500]
 
-        logger.error(
-            "local_campaign_permanent_bounce",
+        logger.warning(
+            "local_campaign_rate_limit_hit",
             vendor_email=vendor_email,
             recipient_id=recipient_id,
-            bounce_type=bounce_type,
-            error=error_msg
+            campaign_id=campaign_id,
+            credential_id=credential_id,
+            error=error_msg,
+            action="credential marked unhealthy, recipient deferred",
         )
 
+        # Mark the attempt as rate_limited
         with DuckDBClient() as db_client:
-            # Update attempt status
             db_client.execute_query("""
                 UPDATE campaign_email_attempts
-                SET status = 'bounced',
-                    bounce_type = ?,
+                SET status = 'rate_limited',
                     error_message = ?,
                     sent_at = ?
                 WHERE id = ?
             """, {
-                "1": bounce_type,
-                "2": error_msg,
-                "3": datetime.utcnow(),
-                "4": attempt_id
+                "1": error_msg,
+                "2": datetime.now(timezone.utc),
+                "3": attempt_id
             })
 
-            # Mark recipient bounced
+            # Defer the recipient — they will be retried tomorrow
             with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
                 service = LocalCampaignService(db_client, api_client)
-                service.mark_recipient_bounced(recipient_id, bounce_type)
-                service.update_daily_metrics(
-                    campaign_id, date.today(),
-                    bounced=1, bounce_type=bounce_type
-                )
+                service.mark_recipient_deferred(recipient_id)
+                service.update_daily_metrics(campaign_id, date.today(), failed=1)
+                
+                # Instantly mark in Redis so the next 800 tasks in the queue fast-fail
+                # without making any API requests or hitting Gmail!
+                mark_credential_rate_limited_redis(credential_id)
+                
+                # Mark this credential as unhealthy in PostgreSQL
+                # Other tasks assigned to healthy credentials keep running!
+                service.mark_credential_rate_limited(credential_id)
 
         _try_send_deferred_report(log_id=log_id, success=False)
 
         return {
             "success": False,
             "error": error_msg,
-            "bounce_type": bounce_type,
-            "mode": "local_duckdb_campaign"
+            "error_type": "rate_limit",
+            "credential_id": credential_id,
+            "recipient_deferred": True,
+            "mode": "local_duckdb_campaign",
         }
 
-    except Exception as e:
-        # Transient error - retry via Celery
+    except SMTPPermanentError as e:
+        # ── Hard bounce: recipient address is permanently bad ─────────────────
+        error_msg = str(e)[:500]
+
+        logger.error(
+            "local_campaign_hard_bounce",
+            vendor_email=vendor_email,
+            recipient_id=recipient_id,
+            credential_id=credential_id,
+            error=error_msg,
+        )
+
+        with DuckDBClient() as db_client:
+            db_client.execute_query("""
+                UPDATE campaign_email_attempts
+                SET status = 'bounced',
+                    bounce_type = 'hard',
+                    error_message = ?,
+                    sent_at = ?
+                WHERE id = ?
+            """, {
+                "1": error_msg,
+                "2": datetime.now(timezone.utc),
+                "3": attempt_id
+            })
+
+            with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
+                service = LocalCampaignService(db_client, api_client)
+                service.update_recipient_status(recipient_id, "hard_bounce", bounce_type="hard")
+                service.update_daily_metrics(campaign_id, date.today(), bounced=1, bounce_type="hard")
+
+        _try_send_deferred_report(log_id=log_id, success=False)
+
+        return {
+            "success": False,
+            "error": error_msg,
+            "error_type": "hard_bounce",
+            "mode": "local_duckdb_campaign",
+        }
+
+    except SMTPAuthError as e:
+        # ── Credential auth failure — do NOT retry ────────────────────────────
+        # Gmail 534/535: bad or missing App Password. The credential is broken
+        # until an admin re-generates it. Retrying 3x wastes 15 minutes.
+        error_msg = str(e)[:500]
+
+        logger.error(
+            "local_campaign_auth_failure",
+            vendor_email=vendor_email,
+            recipient_id=recipient_id,
+            campaign_id=campaign_id,
+            credential_id=credential_id,
+            error=error_msg,
+            action_required="Re-generate App Password in Google Account settings",
+        )
+
+        with DuckDBClient() as db_client:
+            db_client.execute_query("""
+                UPDATE campaign_email_attempts
+                SET status = 'failed',
+                    error_message = ?,
+                    sent_at = ?
+                WHERE id = ?
+            """, {
+                "1": f"[AUTH_FAILURE] {error_msg}",
+                "2": datetime.now(timezone.utc),
+                "3": attempt_id
+            })
+
+        _try_send_deferred_report(log_id=log_id, success=False)
+
+        return {
+            "success": False,
+            "error": error_msg,
+            "error_type": "credential_auth_failure",
+            "retried": False,
+            "mode": "local_duckdb_campaign",
+        }
+
+    except SMTPTransientError as e:
+        # ── Transient failure — retry with exponential backoff ────────────────
+        # Mailbox full, server temporarily busy, network hiccup.
+        # Backoff: 1m → 2m → 4m (2^retry * 60s)
+        backoff_seconds = (2 ** retry_count) * 60
+        error_msg = str(e)[:500]
+
         logger.warning(
             "local_campaign_transient_error",
             vendor_email=vendor_email,
             recipient_id=recipient_id,
-            error=str(e),
-            attempt=task.request.retries
+            credential_id=credential_id,
+            error=error_msg,
+            retry_count=retry_count,
+            next_retry_in_seconds=backoff_seconds,
         )
 
         try:
-            raise task.retry(exc=e)
+            raise task.retry(exc=e, countdown=backoff_seconds)
         except task.MaxRetriesExceededError:
-            # All retries exhausted - mark as soft bounce
-            error_msg = str(e)[:500]
-
+            # All retries exhausted — classify as soft bounce, keep recipient active
             with DuckDBClient() as db_client:
-                # Update attempt status
                 db_client.execute_query("""
                     UPDATE campaign_email_attempts
                     SET status = 'bounced',
@@ -483,28 +638,70 @@ def _send_local_campaign_email(task, payload: Dict[str, Any]) -> Dict[str, Any]:
                         sent_at = ?
                     WHERE id = ?
                 """, {
-                    "1": error_msg,
-                    "2": datetime.utcnow(),
+                    "1": f"[MAX_RETRIES] {error_msg}",
+                    "2": datetime.now(timezone.utc),
                     "3": attempt_id
                 })
-
-                # Update metrics (soft bounce, keep recipient active)
                 with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
                     service = LocalCampaignService(db_client, api_client)
-                    service.update_daily_metrics(
-                        campaign_id, date.today(),
-                        bounced=1, bounce_type="soft"
-                    )
+                    service.update_recipient_status(recipient_id, "soft_bounce", bounce_type="soft")
+                    service.update_daily_metrics(campaign_id, date.today(), bounced=1, bounce_type="soft")
 
             _try_send_deferred_report(log_id=log_id, success=False)
 
             return {
                 "success": False,
                 "error": error_msg,
-                "bounce_type": "soft",
+                "error_type": "soft_bounce",
                 "retries_exceeded": True,
-                "mode": "local_duckdb_campaign"
+                "mode": "local_duckdb_campaign",
             }
+
+    except Exception as e:
+        # ── Unknown error — exponential backoff retry ─────────────────────────
+        backoff_seconds = (2 ** retry_count) * 60
+        error_msg = str(e)[:500]
+
+        logger.error(
+            "local_campaign_unexpected_error",
+            vendor_email=vendor_email,
+            recipient_id=recipient_id,
+            credential_id=credential_id,
+            error=error_msg,
+            retry_count=retry_count,
+            next_retry_in_seconds=backoff_seconds,
+        )
+
+        try:
+            raise task.retry(exc=e, countdown=backoff_seconds)
+        except task.MaxRetriesExceededError:
+            with DuckDBClient() as db_client:
+                db_client.execute_query("""
+                    UPDATE campaign_email_attempts
+                    SET status = 'bounced',
+                        bounce_type = 'soft',
+                        error_message = ?,
+                        sent_at = ?
+                    WHERE id = ?
+                """, {
+                    "1": f"[UNKNOWN_MAX_RETRIES] {error_msg}",
+                    "2": datetime.now(timezone.utc),
+                    "3": attempt_id
+                })
+                with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=60.0) as api_client:
+                    service = LocalCampaignService(db_client, api_client)
+                    service.update_daily_metrics(campaign_id, date.today(), bounced=1, bounce_type="soft")
+
+            _try_send_deferred_report(log_id=log_id, success=False)
+
+            return {
+                "success": False,
+                "error": error_msg,
+                "error_type": "unknown",
+                "retries_exceeded": True,
+                "mode": "local_duckdb_campaign",
+            }
+
 
 
 @celery_app.task(
@@ -533,11 +730,24 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     vendor_email = _sanitize_email(payload.get("vendor_email"))
 
     campaign_email_id = payload.get("campaign_email_id")
-    credential = payload.get("credential", {})
     variables = payload.get("variables", {})
     wf_id = payload.get("workflow_id")
     log_id = payload.get("log_id")            # used for deferred report
     update_sql = payload.get("recipient_update_sql")
+
+    credential_id = payload.get("credential_id")
+    
+    # Read the full credential object directly from the payload injected by the scheduler
+    credential = payload.get("credential", {})
+    if not credential and credential_id:
+        # Fallback for payloads already in the queue before the update
+        with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=30.0) as client:
+            resp = client.get(f"/email-smtp-credentials/{credential_id}")
+            if resp.is_success:
+                credential = resp.json()
+
+    if not credential or not credential.get("email"):
+        raise ValueError(f"Failed to load valid SMTP credential for ID {credential_id}")
 
     logger.info("worker_started", vendor_email=vendor_email)
 
@@ -604,11 +814,10 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         # ── 3.5 Increment SMTP credential daily counter ────────────
-        if credential.get("id"):
-            _increment_credential_sent(
-                credential_id=credential.get("id"),
-                workflow_id=wf_id,
-            )
+        # Restored: critical for proactive quota management so the scheduler
+        # knows when a credential is approaching its limit before Gmail blocks.
+        if credential_id:
+            _increment_credential_sent(credential_id, wf_id)
 
         # ── 4. Increment Redis counter; send report if last task ──
         _try_send_deferred_report(log_id=log_id, success=True)
@@ -616,11 +825,44 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("worker_completed", vendor_email=vendor_email)
         return {"success": True, "vendor_email": vendor_email}
 
+    except SMTPRateLimitError as e:
+        # ── Provider rate-limit — NOT a bounce, mark as deferred ───
+        logger.warning(
+            "worker_rate_limit_hit",
+            error=str(e),
+            vendor_email=vendor_email,
+            credential_id=credential_id,
+            smtp_account=credential.get("email"),
+        )
+        _update_campaign_email_status(
+            campaign_email_id=campaign_email_id,
+            status="deferred",
+            error_message=f"[RATE_LIMIT] {str(e)[:400]}",
+        )
+        # Mark the credential as unhealthy in the database and Redis
+        if credential_id:
+            mark_credential_rate_limited_redis(credential_id)
+            try:
+                with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=10.0) as client:
+                    client.put(
+                        f"/email-smtp-credentials/{credential_id}",
+                        json={"is_healthy": False},
+                    )
+            except Exception:
+                pass  # Non-critical — log already captured above
+        _try_send_deferred_report(log_id=log_id, success=False)
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "rate_limit",
+            "recipient_deferred": True,
+        }
+
     except SMTPPermanentError as e:
-        # ── Permanent SMTP failure — classify and do NOT retry ─────
+        # ── Permanent SMTP failure — hard bounce, do NOT retry ─────
         bounce = _classify_bounce(e)
         logger.error(
-            "worker_permanent_bounce",
+            "worker_hard_bounce",
             error=str(e),
             bounce_type=bounce,
             vendor_email=vendor_email,
@@ -635,20 +877,47 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "success": False,
             "error": str(e),
+            "error_type": "hard_bounce",
             "bounce_type": bounce,
         }
 
+    except SMTPAuthError as e:
+        # ── Credential auth failure — do NOT retry ──────────────
+        logger.error(
+            "worker_auth_failure",
+            error=str(e),
+            vendor_email=vendor_email,
+            smtp_account=credential.get("email"),
+            action_required="Re-generate App Password in Google Account settings",
+        )
+        _update_campaign_email_status(
+            campaign_email_id=campaign_email_id,
+            status="failed",
+            error_message=f"[AUTH_FAILURE] {str(e)[:400]}",
+        )
+        _try_send_deferred_report(log_id=log_id, success=False)
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "credential_auth_failure",
+            "retried": False,
+            "vendor_email": vendor_email,
+        }
+
     except Exception as e:
-        # ── Transient failure — retry via Celery ──────────────────
+        # ── Transient failure — retry with exponential backoff ─────
+        retry_count = self.request.retries
+        backoff_seconds = (2 ** retry_count) * 60
         logger.error(
             "worker_transient_error",
             error=str(e),
             vendor_email=vendor_email,
-            exc_info=True,
+            retry_count=retry_count,
+            next_retry_in_seconds=backoff_seconds,
         )
 
         try:
-            raise self.retry(exc=e)
+            raise self.retry(exc=e, countdown=backoff_seconds)
         except self.MaxRetriesExceededError:
             # All retries exhausted — classify as soft bounce
             _update_campaign_email_status(
@@ -661,6 +930,6 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
             return {
                 "success": False,
                 "error": str(e),
-                "bounce_type": "soft",
+                "error_type": "soft_bounce",
                 "retries_exceeded": True,
             }

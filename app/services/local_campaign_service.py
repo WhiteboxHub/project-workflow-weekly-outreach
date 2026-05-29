@@ -6,12 +6,18 @@ Handles campaign creation, recipient enrollment, sequence progression,
 and metrics tracking.
 """
 
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
 from app.localdb.duckdb_client import DuckDBClient
-from app.utils.business_days import calculate_next_send_at, add_business_days, next_send_window_datetime
+from app.utils.business_days import (
+    calculate_next_send_at,
+    calculate_immediate_send_at,
+    add_business_days,
+    next_send_window_datetime,
+    is_business_day,
+)
 from app.core.logging import get_logger
 from app.core.auth import APIAuth
 from app.core.config import settings
@@ -62,38 +68,63 @@ class LocalCampaignService:
         Returns:
             Local campaign ID
         """
-        # Check if campaign already exists
-        existing_campaign_id = run_parameters.get("local_campaign_id")
+        # Resume active campaign by candidate_id (prevents duplicate active campaigns if schedule_id changes)
+        existing = self.db.fetch_one("""
+            SELECT id, status, remote_schedule_id
+            FROM campaigns
+            WHERE candidate_id = ? AND status = 'active'
+        """, {"1": candidate_id})
 
-        if existing_campaign_id:
-            existing = self.db.fetch_one("""
-                SELECT id, status
-                FROM campaigns
-                WHERE id = ? AND remote_schedule_id = ?
-            """, {"1": existing_campaign_id, "2": schedule_id})
+        if existing:
+            campaign_id = int(existing["id"])
+            
+            # If the user deleted the old schedule and created a new one for the same candidate,
+            # we need to update the remote_schedule_id so completion metrics sync back correctly.
+            if existing["remote_schedule_id"] != schedule_id:
+                try:
+                    self.db.execute_query("""
+                        UPDATE campaigns
+                        SET remote_schedule_id = ?
+                        WHERE id = ?
+                    """, {"1": schedule_id, "2": campaign_id})
+                    logger.info(
+                        "local_campaign_schedule_id_updated",
+                        campaign_id=campaign_id,
+                        old_schedule_id=existing["remote_schedule_id"],
+                        new_schedule_id=schedule_id
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "duckdb_update_blocked_by_fk",
+                        campaign_id=campaign_id,
+                        error=str(e),
+                        hint="DuckDB blocks UPDATE on rows with foreign keys. Ignoring schedule ID update."
+                    )
 
-            if existing:
-                logger.info(
-                    "local_campaign_resumed",
-                    campaign_id=existing_campaign_id,
-                    status=existing["status"],
-                    candidate_id=candidate_id
-                )
-                return existing_campaign_id
+            logger.info(
+                "local_campaign_resumed",
+                campaign_id=campaign_id,
+                status=existing["status"],
+                candidate_id=candidate_id,
+                schedule_id=schedule_id,
+            )
+            return campaign_id
+
+
 
         # Create new campaign
         result = self.db.execute_query("""
             INSERT INTO campaigns (
-                remote_schedule_id, candidate_id, candidate_name,
+                id, remote_schedule_id, candidate_id, candidate_name,
                 workflow_id, status, created_at, total_recipients, active_recipients
-            ) VALUES (?, ?, ?, ?, 'active', ?, 0, 0)
+            ) VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM campaigns), ?, ?, ?, ?, 'active', ?, 0, 0)
             RETURNING id
         """, {
             "1": schedule_id,
             "2": candidate_id,
             "3": candidate_name,
             "4": workflow_id,
-            "5": datetime.utcnow()
+            "5": datetime.now(timezone.utc)
         })
 
         campaign_id = result.fetchone()[0]
@@ -138,14 +169,14 @@ class LocalCampaignService:
             if not existing:
                 self.db.execute_query("""
                     INSERT INTO campaign_steps (
-                        campaign_id, step_number, step_name, delay_days, created_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        id, campaign_id, step_number, step_name, delay_days, created_at
+                    ) VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM campaign_steps), ?, ?, ?, ?, ?)
                 """, {
                     "1": campaign_id,
                     "2": step["step_number"],
                     "3": step["step_name"],
                     "4": step["delay_days"],
-                    "5": datetime.utcnow()
+                    "5": datetime.now(timezone.utc)
                 })
 
         logger.info("local_campaign_steps_created", campaign_id=campaign_id, count=len(steps))
@@ -186,9 +217,16 @@ class LocalCampaignService:
             logger.warning("no_outreach_emails_found", candidate_id=candidate_id)
             return 0
 
-        # Calculate initial next_send_at (immediate with jitter)
-        now = datetime.utcnow()
-        next_send = calculate_next_send_at(now, delay_days=0)
+        # ------------------------------------------------------------------ #
+        # O1 fix: Step 1 must be IMMEDIATE — no business-day or send-window   #
+        # enforcement.  Using calculate_next_send_at(delay_days=0) would      #
+        # silently push Saturday/Sunday enrollments to Monday 9 AM.           #
+        # calculate_immediate_send_at() applies only a small jitter           #
+        # (30–120 s) to avoid SMTP thundering-herd on bulk enrollments.       #
+        # ------------------------------------------------------------------ #
+        now = datetime.now(timezone.utc)
+        next_send = calculate_immediate_send_at(now)
+        _is_weekend = not is_business_day(now)
 
         new_count = 0
 
@@ -211,15 +249,15 @@ class LocalCampaignService:
             # Insert new recipient
             self.db.execute_query("""
                 INSERT INTO campaign_recipients (
-                    campaign_id, vendor_email, outreach_email_id,
+                    id, campaign_id, vendor_email, outreach_email_id,
                     status, current_step_number, next_send_at, enrolled_at
-                ) VALUES (?, ?, ?, 'active', 1, ?, ?)
+                ) VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM campaign_recipients), ?, ?, ?, 'active', 1, ?, ?)
             """, {
                 "1": campaign_id,
                 "2": vendor_email,
                 "3": outreach_email_id,
                 "4": next_send,
-                "5": datetime.utcnow()
+                "5": datetime.now(timezone.utc)
             })
 
             new_count += 1
@@ -242,7 +280,13 @@ class LocalCampaignService:
             "local_campaign_recipients_enrolled",
             campaign_id=campaign_id,
             new=new_count,
-            total=len(remote_emails)
+            total=len(remote_emails),
+            # O1 observability: confirm immediate path was used
+            step=1,
+            scheduled_immediately=True,
+            is_weekend=_is_weekend,
+            day_of_week=now.strftime("%A"),
+            next_send_at=next_send.isoformat(),
         )
 
         return new_count
@@ -260,7 +304,7 @@ class LocalCampaignService:
         Returns:
             Number of new attempts created
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Find recipients due for next step
         due_recipients = self.db.fetch_all("""
@@ -298,15 +342,15 @@ class LocalCampaignService:
             # Create new attempt
             self.db.execute_query("""
                 INSERT INTO campaign_email_attempts (
-                    campaign_id, recipient_id, step_number, vendor_email,
+                    id, campaign_id, recipient_id, step_number, vendor_email,
                     status, created_at
-                ) VALUES (?, ?, ?, ?, 'pending', ?)
+                ) VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM campaign_email_attempts), ?, ?, ?, ?, 'pending', ?)
             """, {
                 "1": campaign_id,
                 "2": recipient_id,
                 "3": step_number,
                 "4": vendor_email,
-                "5": datetime.utcnow()
+                "5": datetime.now(timezone.utc)
             })
 
             new_count += 1
@@ -338,6 +382,15 @@ class LocalCampaignService:
         Returns:
             List of claimed attempt records with full details
         """
+        reset_count = self.db.reset_stale_claims(
+            minutes=settings.stale_claim_minutes
+        )
+        if reset_count:
+            logger.info(
+                "stale_claims_reset_before_claim",
+                campaign_id=campaign_id,
+                count=reset_count,
+            )
         return self.db.claim_pending_attempts(campaign_id, limit, worker_id)
 
     def advance_recipient(
@@ -374,7 +427,7 @@ class LocalCampaignService:
                 SET status = 'completed',
                     last_attempt_at = ?
                 WHERE id = ?
-            """, {"1": datetime.utcnow(), "2": recipient_id})
+            """, {"1": datetime.now(timezone.utc), "2": recipient_id})
 
             logger.info(
                 "local_campaign_recipient_completed",
@@ -404,7 +457,7 @@ class LocalCampaignService:
             return
 
         # Calculate next_send_at
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         next_send = calculate_next_send_at(now, delay_days=step["delay_days"])
 
         # Update recipient
@@ -417,7 +470,7 @@ class LocalCampaignService:
         """, {
             "1": next_step,
             "2": next_send,
-            "3": datetime.utcnow(),
+            "3": datetime.now(timezone.utc),
             "4": recipient_id
         })
 
@@ -430,25 +483,41 @@ class LocalCampaignService:
             next_send_at=next_send.isoformat()
         )
 
-    def mark_recipient_bounced(
+    def update_recipient_status(
         self,
         recipient_id: int,
-        bounce_type: str
+        lifecycle_status: str,
+        bounce_type: Optional[str] = None,
     ) -> None:
         """
-        Mark recipient as bounced (hard/soft/invalid).
+        Update a recipient's lifecycle status in DuckDB.
 
-        Hard and invalid bounces stop all future sends.
-        Soft bounces allow retry (keep status='active').
+        Lifecycle states:
+          - 'active'       : default, ready to send next step
+          - 'sent'         : successfully sent all steps (completed)
+          - 'deferred'     : temporarily skipped due to rate-limit; retry tomorrow
+          - 'rate_limited' : same as deferred but named explicitly for reporting
+          - 'soft_bounce'  : transient failure (mailbox full, server busy)
+          - 'hard_bounce'  : permanent failure (address does not exist)
+          - 'invalid'      : failed email format validation
+          - 'bounced'      : legacy alias kept for backward compat
+
+        Hard/invalid bounces permanently stop future sends (status = 'hard_bounce').
+        Soft bounces and deferred keep status = 'active' so they are retried.
 
         Args:
             recipient_id: Recipient ID
-            bounce_type: Bounce type (hard/soft/invalid)
+            lifecycle_status: One of the states listed above
+            bounce_type: Optional raw bounce label for metrics (hard/soft/invalid)
         """
-        if bounce_type in ("hard", "invalid"):
-            status = "bounced"
+        # Map lifecycle states to the DB status column
+        terminal_states = {"hard_bounce", "invalid", "bounced"}
+        if lifecycle_status in terminal_states:
+            db_status = "hard_bounce"
+        elif lifecycle_status in ("soft_bounce", "deferred", "rate_limited"):
+            db_status = "active"   # Keep eligible for retry
         else:
-            status = "active"  # Soft bounce, allow retry
+            db_status = lifecycle_status   # 'active', 'sent', etc.
 
         self.db.execute_query("""
             UPDATE campaign_recipients
@@ -457,18 +526,119 @@ class LocalCampaignService:
                 last_attempt_at = ?
             WHERE id = ?
         """, {
-            "1": status,
-            "2": bounce_type,
-            "3": datetime.utcnow(),
+            "1": db_status,
+            "2": bounce_type or lifecycle_status,
+            "3": datetime.now(timezone.utc),
             "4": recipient_id
         })
 
         logger.info(
-            "local_campaign_recipient_bounced",
+            "local_campaign_recipient_status_updated",
             recipient_id=recipient_id,
+            lifecycle_status=lifecycle_status,
+            db_status=db_status,
             bounce_type=bounce_type,
-            status=status
         )
+
+    def mark_recipient_bounced(
+        self,
+        recipient_id: int,
+        bounce_type: str
+    ) -> None:
+        """Legacy alias for update_recipient_status. Kept for backward compat."""
+        self.update_recipient_status(
+            recipient_id=recipient_id,
+            lifecycle_status=bounce_type,
+            bounce_type=bounce_type,
+        )
+
+    def mark_recipient_deferred(self, recipient_id: int) -> None:
+        """
+        Mark a recipient as deferred due to a rate-limit on the sending credential.
+
+        The recipient is NOT bounced — they will be retried tomorrow when the
+        sending credential's daily quota resets and is_healthy becomes True again.
+        """
+        self.update_recipient_status(
+            recipient_id=recipient_id,
+            lifecycle_status="deferred",
+        )
+        logger.info(
+            "local_campaign_recipient_deferred",
+            recipient_id=recipient_id,
+            reason="credential_rate_limited",
+        )
+
+    def mark_credential_rate_limited(self, credential_id: int) -> None:
+        """
+        Mark a sending credential as unhealthy due to hitting a provider rate limit.
+
+        Calls PUT /api/email-smtp-credentials/{id} to set is_healthy=False in the
+        main PostgreSQL database. The scheduler will automatically exclude unhealthy
+        credentials from the rotation on the next run, allowing the other 19 (or
+        however many) accounts to continue sending without interruption.
+
+        The credential will need to be manually re-enabled (or auto-healed by a
+        nightly job) once the provider's quota window resets (usually 24 hours).
+        """
+        try:
+            resp = self.api.put(
+                f"/email-smtp-credentials/{credential_id}",
+                json={
+                    "is_healthy": False,
+                },
+            )
+            if resp.is_success:
+                logger.warning(
+                    "credential_marked_rate_limited",
+                    credential_id=credential_id,
+                    action="is_healthy set to False in PostgreSQL",
+                )
+            else:
+                logger.error(
+                    "credential_rate_limit_update_failed",
+                    credential_id=credential_id,
+                    status_code=resp.status_code,
+                    response=resp.text[:200],
+                )
+        except Exception as e:
+            logger.error(
+                "credential_rate_limit_update_error",
+                credential_id=credential_id,
+                error=str(e),
+            )
+
+    def increment_credential_sent(self, credential_id: int) -> None:
+        """
+        Atomically increment current_day_sent for an SMTP credential.
+
+        Uses the dedicated API endpoint which handles date rollover automatically:
+          - If last_reset_date == today: increment current_day_sent by 1
+          - If last_reset_date < today: reset current_day_sent to 1
+
+        This is critical for the scheduler to know when a credential is approaching
+        its daily_limit BEFORE Gmail blocks it with a 5.4.5 rate-limit error.
+        """
+        if not credential_id:
+            return
+        try:
+            resp = self.api.post(
+                f"/email-smtp-credentials/{credential_id}/increment-sent",
+            )
+            if not resp.is_success:
+                logger.warning(
+                    "credential_increment_sent_failed",
+                    credential_id=credential_id,
+                    status_code=resp.status_code,
+                )
+        except Exception as e:
+            logger.error(
+                "credential_increment_sent_error",
+                credential_id=credential_id,
+                error=str(e),
+            )
+
+
 
     def update_daily_metrics(
         self,
@@ -526,10 +696,10 @@ class LocalCampaignService:
         # Upsert metrics
         self.db.execute_query("""
             INSERT INTO campaign_daily_metrics (
-                campaign_id, metric_date, emails_sent, emails_failed,
+                id, campaign_id, metric_date, emails_sent, emails_failed,
                 emails_bounced, hard_bounces, soft_bounces, invalid_emails,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM campaign_daily_metrics), ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (campaign_id, metric_date)
             DO UPDATE SET
                 emails_sent = ?,
@@ -542,10 +712,10 @@ class LocalCampaignService:
         """, {
             "1": campaign_id, "2": metric_date, "3": new_sent, "4": new_failed,
             "5": new_bounced, "6": new_hard, "7": new_soft, "8": new_invalid,
-            "9": datetime.utcnow(),
+            "9": datetime.now(timezone.utc),
             "10": new_sent, "11": new_failed, "12": new_bounced,
             "13": new_hard, "14": new_soft, "15": new_invalid,
-            "16": datetime.utcnow()
+            "16": datetime.now(timezone.utc)
         })
 
     def get_campaign_metrics(self, campaign_id: int) -> Dict[str, Any]:
@@ -628,13 +798,19 @@ class LocalCampaignService:
             run_params = schedule.get("run_parameters", {})
             run_params["local_campaign_id"] = local_campaign_id
             run_params["local_db_path"] = settings.duckdb_campaign_path
-            run_params["local_campaign_created_at"] = datetime.utcnow().isoformat()
+            run_params["local_campaign_created_at"] = datetime.now(timezone.utc).isoformat()
 
-            # Write back to remote
+            # Write back to remote (PATCH preferred; PUT fallback for older APIs)
+            payload = {"run_parameters": run_params}
             resp = self.api.patch(
                 f"/orchestrator/schedules/{schedule_id}",
-                json={"run_parameters": run_params}
+                json=payload,
             )
+            if resp.status_code == 405:
+                resp = self.api.put(
+                    f"/orchestrator/schedules/{schedule_id}",
+                    json=payload,
+                )
             resp.raise_for_status()
 
             logger.info(
@@ -683,7 +859,7 @@ class LocalCampaignService:
                 SET status = 'completed',
                     completed_at = ?
                 WHERE id = ?
-            """, {"1": datetime.utcnow(), "2": campaign_id})
+            """, {"1": datetime.now(timezone.utc), "2": campaign_id})
 
             logger.info(
                 "local_campaign_completed",
@@ -701,7 +877,7 @@ class LocalCampaignService:
 
                 run_params = schedule.get("run_parameters", {})
                 run_params["local_campaign_status"] = "completed"
-                run_params["local_campaign_completed_at"] = datetime.utcnow().isoformat()
+                run_params["local_campaign_completed_at"] = datetime.now(timezone.utc).isoformat()
                 run_params["final_sent_count"] = metrics["total_sent"]
                 run_params["final_bounced_count"] = metrics["total_bounced"]
                 run_params["final_failed_count"] = metrics["total_failed"]

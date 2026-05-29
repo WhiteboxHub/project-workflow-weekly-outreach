@@ -20,24 +20,56 @@ services:
     command: python run_scheduler.py
     env_file:
       - .env
+    environment:
+      - DUCKDB_CAMPAIGN_PATH=/data/campaigns.duckdb   # override relative path from .env
+      - REDIS_URL=redis://redis:6379/0                 # use Docker service name, not localhost
+      - TZ=America/Los_Angeles                         # ensure datetime.now() = Pacific time
+    volumes:
+      - duckdb_data:/data          # persist DuckDB campaigns.duckdb across restarts
     depends_on:
       redis:
         condition: service_healthy
-    restart: unless-stopped
+    restart: always                # auto-restart on crash or Windows reboot
 
   worker:
     build: .
-    # container_name removed — incompatible with deploy.replicas;
-    # Docker auto-names each replica (email_outreach_worker_1, _2, etc.)
+    # Runs inside Linux containers — no --pool=solo needed here.
+    # --pool=solo is only required when running Celery NATIVELY on Windows (outside Docker).
     command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
     env_file:
       - .env
+    environment:
+      - DUCKDB_CAMPAIGN_PATH=/data/campaigns.duckdb   # override relative path from .env
+      - REDIS_URL=redis://redis:6379/0                 # use Docker service name, not localhost
+      - TZ=America/Los_Angeles                         # ensure datetime.now() = Pacific time
+    volumes:
+      - duckdb_data:/data          # same shared volume as scheduler
     depends_on:
       redis:
         condition: service_healthy
-    restart: unless-stopped
+    restart: always                # auto-restart on crash or Windows reboot
     deploy:
       replicas: 2
 
+  daily_report:
+    build: .
+    container_name: email_outreach_daily_report
+    # Daemon that fires the HTML email report every day at 5:00 PM Pacific.
+    # No Windows Task Scheduler or cron needed — fully managed by Docker.
+    command: python run_report_service.py
+    env_file:
+      - .env
+    environment:
+      - DUCKDB_CAMPAIGN_PATH=/data/campaigns.duckdb   # override relative path from .env
+      - REDIS_URL=redis://redis:6379/0                 # use Docker service name, not localhost
+      - TZ=America/Los_Angeles                         # ensures report fires at 5:00 PM PST/PDT
+    volumes:
+      - duckdb_data:/data          # read DuckDB for local campaign attempt data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always                # auto-restart on crash or Windows reboot
+
 volumes:
   redis_data:
+  duckdb_data:                     # named volume — survives container restarts and rebuilds

@@ -6,7 +6,7 @@ time window enforcement, and randomized jitter for email sending.
 """
 
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 
@@ -121,7 +121,11 @@ def calculate_next_send_at(
     """
     Calculate next send time with business days, time window, and jitter.
 
-    Combines all business day logic into a single helper function.
+    USE THIS FOR STEPS 2–4 (follow-ups) only.
+    Steps 2–4 must land on weekdays inside the 9 AM–5 PM send window.
+
+    For Step 1 (initial outreach) use calculate_immediate_send_at() instead —
+    Step 1 must be sent immediately regardless of day or time.
 
     Args:
         from_dt: Starting datetime
@@ -144,3 +148,36 @@ def calculate_next_send_at(
     next_dt = apply_jitter(next_dt, min_jitter, max_jitter)
 
     return next_dt
+
+
+def calculate_immediate_send_at(
+    from_dt: datetime,
+    min_jitter: int = 30,
+    max_jitter: int = 120
+) -> datetime:
+    """
+    Calculate an IMMEDIATE send time — jitter only, NO business-day or
+    send-window enforcement.
+
+    USE THIS FOR STEP 1 (initial outreach) ONLY.
+
+    Step 1 must go out right away regardless of whether it is a weekend,
+    a public holiday, or outside the 9 AM–5 PM window.  Applying
+    business-day logic here would silently defer all Saturday/Sunday
+    enrollments to Monday 9 AM, causing emails_enqueued = 0 for the
+    entire weekend (Bug O1).
+
+    The small jitter (30–120 s) is kept to prevent a thundering-herd of
+    simultaneous SMTP connections when thousands of recipients are
+    enrolled at once.
+
+    Args:
+        from_dt:    Reference datetime (normally datetime.now(timezone.utc))
+        min_jitter: Minimum jitter in seconds (default 30)
+        max_jitter: Maximum jitter in seconds (default 120)
+
+    Returns:
+        from_dt + random jitter — always in the near future, never
+        deferred to the next business day.
+    """
+    return apply_jitter(from_dt, min_jitter, max_jitter)

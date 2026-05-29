@@ -99,10 +99,12 @@ def _run_scheduler_continuously(interval_seconds: int) -> None:
         except Exception as e:
             logger.error("scheduler_run_error", error=str(e), exc_info=True)
 
-        # Check and trigger daily report at or after 6 PM (18:00)
+        # Check and trigger daily report at or after 5:00 PM Pacific (17:00)
+        # NOTE: This is a fail-safe. The daily_report container is the primary trigger.
+        # Both use the same Redis NX key, so the report is only sent once per day.
         try:
             now = datetime.datetime.now()
-            if now.hour >= 18:
+            if now.hour == 17 and now.minute >= 0 or now.hour > 17:
                 today_str = now.strftime("%Y-%m-%d")
                 r = get_redis()
                 # SET NX ensures the report runs exactly once per day, even across restarts

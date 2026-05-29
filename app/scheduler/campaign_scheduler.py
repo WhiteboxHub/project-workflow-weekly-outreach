@@ -10,9 +10,10 @@ Flow per schedule:
 6. Send HTML run report to admin
 """
 
+import json
 import random
 import uuid
-from typing import Dict, Any
+from typing import Any, Dict
 from datetime import date
 
 import httpx
@@ -26,6 +27,31 @@ from app.core.redis_client import (
 from app.services.report_service import send_run_report
 
 logger = get_logger(__name__)
+
+
+def _normalize_run_parameters(run_params: Any) -> Dict[str, Any]:
+    """Parse run_parameters when the API returns JSON as a string."""
+    if run_params is None:
+        return {}
+    if isinstance(run_params, str):
+        try:
+            parsed = json.loads(run_params)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    if isinstance(run_params, dict):
+        return run_params
+    return {}
+
+
+def _normalize_linkedin_url(url: Any) -> str:
+    """Prepend https:// if it's missing from a raw linkedin domain."""
+    if not url or not isinstance(url, str):
+        return ""
+    url = url.strip()
+    if url.lower().startswith("www.linkedin.com") or url.lower().startswith("linkedin.com"):
+        return f"https://{url}"
+    return url
 
 
 def _calculate_daily_limit(cred: Dict[str, Any]) -> int:
@@ -87,12 +113,12 @@ def _run_local_campaign_schedule(
 
     sched_id = schedule.get("id")
     wf_id = schedule.get("automation_workflow_id")
-    run_params = schedule.get("run_parameters") or {}
+    run_params = _normalize_run_parameters(schedule.get("run_parameters"))
     candidate_id = run_params.get("candidate_id")
 
     # Extract required identity vars
     candidate_name = run_params.get("candidate_name")
-    linkedin_url = run_params.get("linkedin_url")
+    linkedin_url = _normalize_linkedin_url(run_params.get("linkedin_url"))
 
     if not candidate_name or not linkedin_url:
         raise ValueError(
@@ -114,17 +140,25 @@ def _run_local_campaign_schedule(
             run_parameters=run_params
         )
 
-        # Check if campaign is new (not in run_parameters)
-        is_new_campaign = not run_params.get("local_campaign_id")
+        # Setup steps/enrollment until we have at least one recipient
+        recipient_row = db_client.fetch_one("""
+            SELECT COUNT(*) AS cnt
+            FROM campaign_recipients
+            WHERE campaign_id = ?
+        """, {"1": campaign_id})
+        recipient_count = int(recipient_row["cnt"] or 0) if recipient_row else 0
+        needs_setup = recipient_count == 0
 
-        if is_new_campaign:
-            # Create default weekly sequence steps
+        if needs_setup:
             service.create_default_steps(campaign_id)
-
-            # Enroll recipients from remote API
-            service.enroll_recipients(campaign_id, candidate_id)
-
-            # Write local_campaign_id back to remote
+            enrolled = service.enroll_recipients(campaign_id, candidate_id)
+            if enrolled == 0:
+                logger.warning(
+                    "local_campaign_no_recipients_enrolled",
+                    campaign_id=campaign_id,
+                    candidate_id=candidate_id,
+                    hint="Implement GET /orchestrator/candidates/{id}/outreach-emails on the backend",
+                )
             service.update_remote_run_parameters(sched_id, campaign_id)
 
         # Generate due attempts for recipients with next_send_at <= NOW()
@@ -210,24 +244,41 @@ def _run_local_campaign_schedule(
             pending_remaining=0,
         )
 
+        # Pre-fetch templates for steps 2, 3, 4 to avoid calling API inside loop
+        step_templates = {1: template}
+        for s, key in [(2, "WeeklyOutreach_F1"), (3, "WeeklyOutreach_F2"), (4, "WeeklyOutreach_Final")]:
+            resp = client.get(f"/email-template/by-key/{key}")
+            if resp.is_success:
+                step_templates[s] = resp.json()
+            else:
+                logger.warning(
+                    "failed_to_fetch_step_template", 
+                    step=s, key=key, status=resp.status_code
+                )
+                step_templates[s] = template # fallback to initial template
+
         # Build & enqueue Celery tasks
         for idx, attempt in enumerate(claimed_attempts):
             # Round-robin across SMTP accounts
             cred = smtp_creds[idx % len(smtp_creds)]
+
+            step_num = attempt.get("step_number", 1)
+            step_tmpl = step_templates.get(step_num, template)
 
             payload = {
                 "mode": "local_duckdb_campaign",
                 "attempt_id": attempt["attempt_id"],
                 "campaign_id": campaign_id,
                 "recipient_id": attempt["recipient_id"],
-                "step_number": attempt["step_number"],
+                "step_number": step_num,
                 "vendor_email": attempt["vendor_email"],
                 "workflow_id": wf_id,
                 "candidate_id": candidate_id,
                 "log_id": log_id,
-                "credential": cred,
-                "template_subject": template.get("subject", ""),
-                "template_body_html": template.get("content_html", ""),
+                "credential_id": cred.get("id"),
+                "credential": cred,  # Pass full cred so worker doesn't need to fetch it
+                "template_subject": step_tmpl.get("subject", ""),
+                "template_body_html": step_tmpl.get("content_html", ""),
                 "variables": {
                     **run_params,
                     "candidate_name": candidate_name,
@@ -299,7 +350,7 @@ def run_scheduler() -> Dict[str, Any]:
             for schedule in schedules:
                 sched_id = schedule.get("id")
                 wf_id = schedule.get("automation_workflow_id")
-                run_params = schedule.get("run_parameters") or {}
+                run_params = _normalize_run_parameters(schedule.get("run_parameters"))
                 candidate_id = run_params.get("candidate_id")
 
                 if not candidate_id:
@@ -419,7 +470,7 @@ def run_scheduler() -> Dict[str, Any]:
 
                     # Strictly require candidate name and linkedin_url from run_parameters
                     candidate_name = run_params.get("candidate_name")
-                    linkedin_url_resolved = run_params.get("linkedin_url")
+                    linkedin_url_resolved = _normalize_linkedin_url(run_params.get("linkedin_url"))
 
                     if not candidate_name or not linkedin_url_resolved:
                         raise ValueError(
@@ -556,7 +607,8 @@ def run_scheduler() -> Dict[str, Any]:
                             "candidate_id": candidate_id,
                             "log_id": log_id,
                             "recipient_update_sql": update_sql,
-                            "credential": cred,
+                            "credential_id": cred.get("id"),
+                            "credential": cred,  # Pass full cred so worker doesn't need to fetch it
                             "template_subject": template.get(
                                 "subject", ""
                             ),

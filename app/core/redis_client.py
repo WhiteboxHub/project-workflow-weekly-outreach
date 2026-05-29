@@ -144,3 +144,31 @@ def claim_report_slot(log_id: int) -> bool:
         return bool(claimed)
     except Exception:
         return True  # Redis down: allow the report rather than silently drop it
+
+
+def mark_credential_rate_limited_redis(credential_id: int) -> None:
+    """
+    Instantly flags a credential as rate-limited in Redis (24-hour TTL).
+    Allows Celery workers to fast-fail the remaining 800 tasks in the queue
+    without needing to make 800 HTTP GET requests to the backend API.
+    """
+    if not credential_id:
+        return
+    try:
+        r = get_redis()
+        # 24 hours (86400 seconds) matches Gmail's typical quota reset window
+        r.set(f"credential_rate_limited:{credential_id}", "1", ex=86400)
+    except Exception:
+        pass
+
+
+def is_credential_rate_limited_redis(credential_id: int) -> bool:
+    """Returns True if the credential was recently rate-limited."""
+    if not credential_id:
+        return False
+    try:
+        r = get_redis()
+        return bool(r.get(f"credential_rate_limited:{credential_id}"))
+    except Exception:
+        return False
+

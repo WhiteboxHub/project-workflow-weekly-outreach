@@ -6,10 +6,11 @@ and safe query helpers for the local campaign execution engine.
 """
 
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import duckdb
 from app.core.config import settings
@@ -23,6 +24,7 @@ class DuckDBClient:
     DuckDB client for local campaign execution.
 
     Manages connection, schema, and provides safe query helpers.
+    Includes robust retry logic for multi-process file locking.
     """
 
     def __init__(self, db_path: Optional[str] = None):
@@ -34,9 +36,25 @@ class DuckDBClient:
         """
         self.db_path = db_path or settings.duckdb_campaign_path
         self._ensure_directory()
-        self.conn = duckdb.connect(self.db_path)
+        
+        # DuckDB allows only ONE process to hold the write lock.
+        # Since Scheduler and 4 Celery workers run concurrently, we MUST wait for the lock.
+        max_retries = 100
+        retry_delay = 0.1  # Wait 100ms between attempts (up to 10 seconds total)
+        
+        for attempt in range(max_retries):
+            try:
+                self.conn = duckdb.connect(self.db_path)
+                break
+            except duckdb.IOException as e:
+                if "Could not set lock on file" in str(e) and attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                logger.error("duckdb_lock_timeout", db_path=self.db_path, attempt=attempt)
+                raise e
+
         self._initialize_schema()
-        logger.info("duckdb_client_initialized", db_path=self.db_path)
+        logger.debug("duckdb_client_initialized", db_path=self.db_path)
 
     def _ensure_directory(self) -> None:
         """Create directory for DuckDB file if it doesn't exist."""
@@ -58,8 +76,7 @@ class DuckDBClient:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 completed_at TIMESTAMP,
                 total_recipients INTEGER DEFAULT 0,
-                active_recipients INTEGER DEFAULT 0,
-                UNIQUE(remote_schedule_id, candidate_id)
+                active_recipients INTEGER DEFAULT 0
             )
         """)
 
@@ -82,8 +99,7 @@ class DuckDBClient:
                 step_name VARCHAR,
                 delay_days INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(campaign_id, step_number),
-                FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+                UNIQUE(campaign_id, step_number)
             )
         """)
 
@@ -105,8 +121,7 @@ class DuckDBClient:
                 enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_attempt_at TIMESTAMP,
                 bounce_type VARCHAR,
-                UNIQUE(campaign_id, vendor_email),
-                FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+                UNIQUE(campaign_id, vendor_email)
             )
         """)
 
@@ -135,9 +150,7 @@ class DuckDBClient:
                 error_message VARCHAR,
                 bounce_type VARCHAR,
                 credential_id INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (campaign_id) REFERENCES campaigns(id),
-                FOREIGN KEY (recipient_id) REFERENCES campaign_recipients(id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -159,8 +172,7 @@ class DuckDBClient:
                 soft_bounces INTEGER DEFAULT 0,
                 invalid_emails INTEGER DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(campaign_id, metric_date),
-                FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+                UNIQUE(campaign_id, metric_date)
             )
         """)
 
@@ -262,7 +274,7 @@ class DuckDBClient:
         Returns:
             List of claimed attempt records with full details
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         with self.transaction():
             # Select pending attempts
@@ -349,7 +361,7 @@ class DuckDBClient:
         Returns:
             Number of attempts reset
         """
-        threshold = datetime.utcnow()
+        threshold = datetime.now(timezone.utc) - timedelta(minutes=minutes)
 
         result = self.execute_query("""
             UPDATE campaign_email_attempts
@@ -357,11 +369,12 @@ class DuckDBClient:
                 claimed_at = NULL,
                 claimed_by = NULL
             WHERE status = 'claimed'
-              AND claimed_at < (CURRENT_TIMESTAMP - INTERVAL ? MINUTE)
+              AND claimed_at < ?
               AND sent_at IS NULL
-        """, {"1": minutes})
+            RETURNING id
+        """, {"1": threshold})
 
-        count = result.fetchone()[0] if result else 0
+        count = len(result.fetchall()) if result else 0
 
         if count > 0:
             logger.warning("stale_claims_reset", count=count, minutes=minutes)

@@ -19,26 +19,120 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Gmail SMTP error codes that mean "stop retrying, you're blocked"
-PERMANENT_BLOCK_CODES = {421, 450, 550, 553, 554}
-PERMANENT_BLOCK_PHRASES = [
+# ---------------------------------------------------------------------------
+# Gmail SMTP error taxonomy
+# ---------------------------------------------------------------------------
+
+# ── SMTP Error code taxonomy ────────────────────────────────────────────────
+
+# Codes that Gmail uses for SENDER quota / rate-limit (not the recipient's fault)
+# 421 = Service temporarily unavailable
+# 450 = Requested action not taken (often rate limit)
+# 550 = Can be EITHER rate-limit OR hard-bounce — must inspect the phrase too
+RATE_LIMIT_CODES = {421, 450}
+
+# Phrases that confirm this is a SENDER quota / provider rate-limit error.
+# These take priority over HARD_BOUNCE_PHRASES when the code alone is ambiguous.
+RATE_LIMIT_PHRASES = [
+    "daily user sending limit",
+    "daily sending limit",
+    "too many messages",
+    "rate limit",
+    "quota exceeded",
+    "exceeded sending limit",
+    "sending limit exceeded",
+    "too many recipients",
+    "4.7.28",   # Gmail DMARC rate-limit code
+    "4.7.29",   # Gmail DKIM rate-limit code
+    "5.4.5",    # Gmail daily limit SMTP status
+]
+
+# Codes that mean a RECIPIENT-level permanent block (wrong address, domain gone)
+PERMANENT_BLOCK_CODES = {550, 551, 553, 554}
+
+# Phrases that confirm a RECIPIENT hard-bounce (address does not exist).
+# Only used when the error is NOT a rate-limit first.
+HARD_BOUNCE_PHRASES = [
+    "user does not exist",
+    "does not exist",
+    "no such user",
+    "user unknown",
+    "unknown user",
+    "mailbox not found",
+    "mailbox unavailable",
+    "invalid address",
+    "address rejected",
+    "recipient address rejected",
+    "bad destination",
     "message rejected",
     "message blocked",
-    "daily user sending limit",
-    "too many messages",
-    "suspected spam",
     "account has been disabled",
-    "rate limit",
+    "account disabled",
+    "suspected spam",
+]
+
+# Codes that mean a CREDENTIAL-level auth failure (wrong/missing App Password)
+# 534 = Application-specific password required (needs App Password enabled)
+# 535 = Username and password not accepted (wrong App Password)
+# These are NEVER transient — retrying 3x wastes 15 minutes with zero chance
+# of success until the credential is corrected in the admin panel.
+SMTP_AUTH_CODES = {534, 535}
+
+SMTP_AUTH_PHRASES = [
+    "application-specific password required",
+    "application specific password",
+    "web login required",
+    "username and password not accepted",
+    "invalid credentials",
+    "authentication failed",
+    "authentication unsuccessful",
+    "please log in via your web browser",  # Gmail 534 message body
+    "534-5.7.9",                           # Gmail ESMTP prefix for App PW errors
+    "535-5.7.8",                           # Gmail ESMTP prefix for wrong password
 ]
 
 
 class SMTPPermanentError(Exception):
-    """Raised when Gmail permanently rejects the message (do NOT retry)."""
+    """Raised when the message is PERMANENTLY rejected at the RECIPIENT level.
+
+    This means the address is bad (does not exist, mailbox not found, etc.).
+    Do NOT retry — mark the recipient as hard_bounce and stop sending to them.
+    """
+    pass
+
+
+class SMTPRateLimitError(Exception):
+    """Raised when the SENDING ACCOUNT hits a provider quota / rate-limit.
+
+    This is a TRANSPORT error, NOT a recipient error. The recipient is fine.
+    The sending credential should be marked as unhealthy (is_healthy=False)
+    and the recipient left in 'deferred' state to be retried tomorrow.
+
+    Examples:
+      - Gmail 5.4.5: Daily user sending limit exceeded
+      - Gmail 4.7.28: Rate limit
+      - Any 421/450 transient overload
+    """
+    pass
+
+
+class SMTPAuthError(Exception):
+    """Raised when Gmail rejects the CREDENTIAL (wrong/missing App Password).
+
+    This is distinct from SMTPPermanentError (recipient rejection) and
+    SMTPTransientError (network/mailbox-full).  Auth errors MUST NOT be
+    retried — the credential is broken until an admin fixes it.
+
+    Callers should:
+      1. Mark the attempt as 'credential_auth_failure' (not 'soft' bounce)
+      2. Stop dispatching further emails for this run
+      3. Alert the admin to re-generate or enable the App Password
+    """
     pass
 
 
 class SMTPTransientError(Exception):
-    """Raised on temporary failures (safe to retry)."""
+    """Raised on temporary failures (mailbox full, server busy). Safe to retry."""
     pass
 
 
@@ -180,14 +274,76 @@ class SMTPClient:
                 "message_id": msg_id,
             }
 
+        except smtplib.SMTPAuthenticationError as e:
+            # ── O2 fix: auth failures are NEVER transient ────────────────
+            # Gmail 534: App Password required (2FA enabled but no App PW)
+            # Gmail 535: Wrong App Password
+            # Both are permanent credential errors — retrying wastes time.
+            error_str = str(e).lower()
+            auth_code = getattr(e, "smtp_code", 0) or 0
+
+            logger.error(
+                "smtp_auth_failure",
+                to_email=to_email,
+                from_email=sender,
+                host=self.host,
+                smtp_code=auth_code,
+                error=str(e),
+            )
+            raise SMTPAuthError(
+                f"SMTP authentication failed (code {auth_code}): {str(e)}"
+            ) from e
+
         except smtplib.SMTPException as e:
             error_str = str(e).lower()
             error_code = getattr(e, "smtp_code", 0) or 0
 
-            is_permanent = (
-                error_code in PERMANENT_BLOCK_CODES
-                or any(phrase in error_str for phrase in PERMANENT_BLOCK_PHRASES)
+            # ── Priority 1: Auth failures ─────────────────────────────────────
+            # Check auth FIRST — some auth errors arrive as generic SMTPException
+            is_auth = (
+                error_code in SMTP_AUTH_CODES
+                or any(phrase in error_str for phrase in SMTP_AUTH_PHRASES)
             )
+            if is_auth:
+                logger.error(
+                    "smtp_auth_failure_via_phrase",
+                    to_email=to_email,
+                    from_email=sender,
+                    host=self.host,
+                    smtp_code=error_code,
+                    error=str(e),
+                )
+                raise SMTPAuthError(
+                    f"SMTP authentication failed (code {error_code}): {str(e)}"
+                ) from e
+
+            # ── Priority 2: Rate-limit / quota errors (SENDER transport failure)
+            # MUST be checked before hard-bounce phrases because Gmail's 550
+            # rate-limit message contains "5.4.5" but NOT hard-bounce phrases.
+            is_rate_limit = (
+                error_code in RATE_LIMIT_CODES
+                or any(phrase in error_str for phrase in RATE_LIMIT_PHRASES)
+            )
+            if is_rate_limit:
+                logger.warning(
+                    "smtp_rate_limit_hit",
+                    to_email=to_email,
+                    from_email=sender,
+                    host=self.host,
+                    smtp_code=error_code,
+                    error=str(e),
+                )
+                raise SMTPRateLimitError(
+                    f"Provider rate limit exceeded (code {error_code}): {str(e)}"
+                ) from e
+
+            # ── Priority 3: Hard bounce (RECIPIENT permanent failure) ──────────
+            is_hard_bounce = (
+                error_code in PERMANENT_BLOCK_CODES
+                and any(phrase in error_str for phrase in HARD_BOUNCE_PHRASES)
+            )
+            # Fallback: 55x with no matching phrase — assume hard bounce
+            is_permanent = is_hard_bounce or error_code in PERMANENT_BLOCK_CODES
 
             logger.error(
                 "smtp_send_error",
@@ -195,23 +351,24 @@ class SMTPClient:
                 error=str(e),
                 error_type=type(e).__name__,
                 smtp_code=error_code,
-                permanent=is_permanent,
+                is_hard_bounce=is_hard_bounce,
+                is_permanent=is_permanent,
             )
 
             if is_permanent:
                 raise SMTPPermanentError(
-                    f"Gmail permanently blocked: {str(e)}"
+                    f"Recipient permanently rejected (code {error_code}): {str(e)}"
                 ) from e
             else:
                 raise SMTPTransientError(
-                    f"SMTP transient error: {str(e)}"
+                    f"SMTP transient error (code {error_code}): {str(e)}"
                 ) from e
 
         except Exception as e:
             logger.error(
-                "smtp_send_error",
+                "smtp_unexpected_error",
                 to_email=to_email,
                 error=str(e),
                 exc_info=True,
             )
-            raise SMTPTransientError(f"Unexpected error: {str(e)}") from e
+            raise SMTPTransientError(f"Unexpected SMTP error: {str(e)}") from e
