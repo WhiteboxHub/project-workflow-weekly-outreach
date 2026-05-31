@@ -22,6 +22,7 @@ at end of business (e.g. 5:15 PM):
 """
 
 import sys
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -195,6 +196,105 @@ def _aggregate(records: list[dict]) -> list[dict]:
     return list(buckets.values())
 
 
+WORKFLOW_ID = 3  # automation_workflows.id for 'weekly_vendor_outreach'
+
+
+def _write_workflow_logs(candidates: list[dict], run_date_str: str) -> None:
+    """
+    Write one automation_workflow_logs row per candidate to the backend API.
+
+    - Uses POST /automation-workflow-log/ (existing FastAPI endpoint).
+    - run_id format: "outreach-{candidate_id}-{YYYY-MM-DD}" — unique per candidate/day.
+    - status logic:
+        success         → all processed records sent (failed + bounced == 0)
+        partial_success → some sent, some failed/bounced
+        failed          → nothing sent at all
+    - started_at = 9:00 AM today (start of business send window)
+    - finished_at = now (time the report is being written)
+    - Silently logs and returns on any error — never blocks the email report.
+    """
+    today = date.today().isoformat()
+    started_at = datetime.now(timezone.utc).replace(hour=9, minute=0, second=0, microsecond=0)
+    finished_at = datetime.now(timezone.utc)
+
+    for candidate in candidates:
+        cid        = candidate.get("id") or 0
+        name       = candidate.get("name") or f"Candidate {cid}"
+        sent       = candidate.get("sent", 0)
+        failed     = candidate.get("failed", 0)
+        bounced    = candidate.get("bounced", 0)
+        total      = sent + failed + bounced
+
+        # Determine status
+        if total == 0:
+            status = "failed"
+        elif failed == 0 and bounced == 0:
+            status = "success"
+        elif sent > 0:
+            status = "partial_success"
+        else:
+            status = "failed"
+
+        payload = {
+            "workflow_id":       WORKFLOW_ID,
+            "schedule_id":       None,          # schedule_id not tracked locally; set to None
+            "run_id":            f"outreach-{cid}-{today}-{uuid.uuid4().hex[:8]}",
+            "status":            status,
+            "parameters_used": {
+                "candidate_id":   cid,
+                "candidate_name": name,
+                "run_date":       today,
+            },
+            "execution_metadata": {
+                "emails_sent":    sent,
+                "emails_failed":  failed,
+                "emails_bounced": bounced,
+                "hard_bounces":   candidate.get("hard", 0),
+                "soft_bounces":   candidate.get("soft", 0),
+                "invalid_bounces":candidate.get("invalid", 0),
+                "total_processed":total,
+                "source":         "local_duckdb" if settings.use_local_duckdb_campaigns else "remote_api",
+            },
+            "records_processed": sent,
+            "records_failed":    failed + bounced,
+            "started_at":        started_at.isoformat(),
+            "finished_at":       finished_at.isoformat(),
+        }
+
+        try:
+            resp = httpx.post(
+                f"{settings.api_url}/automation-workflow-log/",
+                json=payload,
+                auth=APIAuth(),
+                timeout=15.0,
+                follow_redirects=True,
+            )
+            if resp.status_code == 201:
+                logger.info(
+                    "workflow_log_written",
+                    candidate_id=cid,
+                    status=status,
+                    sent=sent,
+                    failed=failed,
+                    bounced=bounced,
+                )
+            else:
+                logger.warning(
+                    "workflow_log_unexpected_status",
+                    candidate_id=cid,
+                    http_status=resp.status_code,
+                    body=resp.text[:200],
+                )
+        except Exception as e:
+            # Never let a log failure block the report from completing
+            logger.error(
+                "workflow_log_failed",
+                candidate_id=cid,
+                error=str(e),
+            )
+
+
+
 def main() -> None:
     today = date.today().strftime("%A, %B %d %Y")
     logger.info("daily_report_starting", date=today)
@@ -218,6 +318,9 @@ def main() -> None:
     print(f"  Sending email to: {settings.report_recipient_email}\n")
 
     send_daily_report(candidates=candidates)
+
+    # Write one automation_workflow_logs row per candidate to the backend DB
+    _write_workflow_logs(candidates=candidates, run_date_str=date.today().isoformat())
 
     logger.info(
         "daily_report_complete",
