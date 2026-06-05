@@ -288,10 +288,18 @@ def _run_local_campaign_schedule(
                 },
             }
 
-            delay = random.randint(
-                settings.min_delay_seconds,
-                settings.max_delay_seconds,
-            )
+            # Spread emails evenly across the business day (9 AM → 5 PM = 28800 seconds).
+            # Each email gets a progressively later slot with small random jitter (±60s)
+            # so sends look natural and don't trigger Gmail's bulk-sending detection.
+            total_emails = len(claimed_attempts)
+            spread_seconds = 8 * 3600  # 8 hours = 28800 seconds
+            if total_emails > 1:
+                base_delay = int((idx / (total_emails - 1)) * spread_seconds)
+            else:
+                base_delay = 0
+            jitter = random.randint(0, min(60, settings.min_delay_seconds))
+            delay = base_delay + jitter
+
             send_outreach_email.apply_async(
                 kwargs={"payload": payload},
                 countdown=delay,
@@ -639,10 +647,17 @@ def run_scheduler() -> Dict[str, Any]:
                             ),
                         )
 
-                        delay = random.randint(
-                            settings.min_delay_seconds,
-                            settings.max_delay_seconds,
-                        )
+                        # Spread emails evenly across the business day (9 AM → 5 PM = 28800 seconds).
+                        # Each email gets a progressively later slot with small random jitter (±60s)
+                        # so sends look natural and don't trigger Gmail's bulk-sending detection.
+                        spread_seconds = 8 * 3600  # 8 hours = 28800 seconds
+                        if target_count > 1:
+                            base_delay = int((idx / (target_count - 1)) * spread_seconds)
+                        else:
+                            base_delay = 0
+                        jitter = random.randint(0, min(60, settings.min_delay_seconds))
+                        delay = base_delay + jitter
+
                         send_outreach_email.apply_async(
                             kwargs={"payload": payload},
                             countdown=delay,

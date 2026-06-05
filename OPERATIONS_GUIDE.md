@@ -103,7 +103,7 @@ For each candidate you want to outreach:
 | Outreach enabled | `candidate_marketing.run_outreach_emails = 1` |
 | Name for templates | `candidate.full_name` |
 | LinkedIn in templates | `candidate.linkedin_id` (used as `linkedin_url`) |
-| Vendor list | `outreach_email_recipients` — `ACTIVE`, valid emails |
+| Vendor list | `outreach_emails` — `ACTIVE`, valid emails |
 | SMTP accounts | `email_smtp_credentials` — `is_active = 1`, valid **Gmail App Password** |
 | Workflow active | `automation_workflows` id **3** (weekly outreach) — `status = 'active'` |
 
@@ -376,7 +376,7 @@ ExecStart=/path/to/venv/bin/celery -A app.workers.celery_app worker --loglevel=i
 
 - [ ] `run_outreach_emails = 1` only when ready to send
 - [ ] `run_parameters` has `candidate_id`, `candidate_name`, `linkedin_url`
-- [ ] Vendor list populated in `outreach_email_recipients`
+- [ ] Vendor list populated in `outreach_emails`
 - [ ] SMTP accounts under daily limit (`daily_limit`, `current_day_sent`)
 - [ ] Worker + scheduler healthy
 - [ ] Suppression / bounce rules understood (`data/suppression_list.csv` on analytics runs)

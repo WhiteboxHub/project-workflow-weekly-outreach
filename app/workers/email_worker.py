@@ -839,17 +839,9 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
             status="deferred",
             error_message=f"[RATE_LIMIT] {str(e)[:400]}",
         )
-        # Mark the credential as unhealthy in the database and Redis
+        # Instantly block this credential across all workers for 24 hours
         if credential_id:
             mark_credential_rate_limited_redis(credential_id)
-            try:
-                with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=10.0) as client:
-                    client.put(
-                        f"/email-smtp-credentials/{credential_id}",
-                        json={"is_healthy": False},
-                    )
-            except Exception:
-                pass  # Non-critical — log already captured above
         _try_send_deferred_report(log_id=log_id, success=False)
         return {
             "success": False,
@@ -895,6 +887,18 @@ def send_outreach_email(self, payload: Dict[str, Any]) -> Dict[str, Any]:
             status="failed",
             error_message=f"[AUTH_FAILURE] {str(e)[:400]}",
         )
+        
+        # Mark credential permanently unhealthy in DB so scheduler ignores it
+        if credential_id:
+            try:
+                with httpx.Client(base_url=settings.api_url, auth=APIAuth(), timeout=10.0) as client:
+                    client.put(
+                        f"/email-smtp-credentials/{credential_id}",
+                        json={"is_healthy": False},
+                    )
+            except Exception:
+                pass
+                
         _try_send_deferred_report(log_id=log_id, success=False)
         return {
             "success": False,

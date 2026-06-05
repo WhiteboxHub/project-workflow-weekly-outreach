@@ -42,12 +42,12 @@ class Settings(BaseSettings):
     google_redirect_uri: Optional[str] = None
 
     # Rate Limiting (fallback defaults – per-account limits are read from DB)
-    min_delay_seconds: int = 30
-    max_delay_seconds: int = 120
+    min_delay_seconds: int = 60
+    max_delay_seconds: int = 300
 
     # Scheduler
-    scheduler_interval_seconds: int = 60
-    scheduler_batch_size: int = 100  # Max vendors per candidate per run
+    scheduler_interval_seconds: int = 300
+    scheduler_batch_size: int = 1000  # Max vendors per candidate per run (override via SCHEDULER_BATCH_SIZE in .env)
 
     # Monitoring
     sentry_dsn: Optional[str] = None
